@@ -34,12 +34,24 @@ except:
 
 from utils.model_utils import str_to_dtype
 from utils.safetensors_utils import mem_eff_save_file
-from dataset.image_video_dataset import load_video, glob_images, resize_image_to_bucket
+from dataset.image_video_dataset import glob_images, resize_image_to_bucket
 
 import logging
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
+
+
+def load_images(directory, video_length, bucket_reso):
+    image_files = glob_images(directory)
+    image_files.sort()
+    images = []
+    for fname in image_files[:video_length]:
+        img = Image.open(fname).convert("RGB")
+        if bucket_reso is not None:
+            img = resize_image_to_bucket(img, bucket_reso)
+        images.append(np.array(img))
+    return images
 
 
 def clean_memory_on_device(device):
@@ -454,6 +466,11 @@ def parse_args():
     parser.add_argument("--no_metadata", action="store_true", help="do not save metadata")
     parser.add_argument("--latent_path", type=str, nargs="*", default=None, help="path to latent for decode. no inference")
     parser.add_argument("--lycoris", action="store_true", help="use lycoris for inference")
+    
+    # NEW: pose guidance arguments
+    parser.add_argument("--use_pose", action="store_true", help="Enable pose guidance injection")
+    parser.add_argument("--pose_path", type=str, default=None, help="Path to a folder or video file containing pose images (e.g. skeleton maps)")
+    parser.add_argument("--pose_alpha", type=float, default=1.0, help="Scaling factor to weight the pose latent injection (default: 1.0)")
 
     args = parser.parse_args()
 
@@ -645,8 +662,11 @@ def main():
         # Prepare latents
         num_channels_latents = 16  # transformer.config.in_channels
         vae_scale_factor = 2 ** (4 - 1)  # len(self.vae.config.block_out_channels) == 4
+        
+        vae, vae_dtype = prepare_vae(args, device)
 
-        vae_ver = vae.VAE_VER
+#        vae_ver = vae.VAE_VER
+        vae_ver = "884-16c-hy"
         if "884" in vae_ver:
             latent_video_length = (video_length - 1) // 4 + 1
         elif "888" in vae_ver:
@@ -654,21 +674,67 @@ def main():
         else:
             latent_video_length = video_length
 
-        # shape = (
-        #     num_videos_per_prompt,
-        #     num_channels_latents,
-        #     latent_video_length,
-        #     height // vae_scale_factor,
-        #     width // vae_scale_factor,
-        # )
-        # latents = randn_tensor(shape, generator=generator, device=device, dtype=dit_dtype)
-
-        # make first N frames to be the same
-        shape_or_frame = (num_videos_per_prompt, num_channels_latents, 1, height // vae_scale_factor, width // vae_scale_factor)
-        latents = []
+        # Set up noise latent as usual:
+        num_channels_latents = 16  # typically VAE.config.latent_channels
+        shape_or_frame = (
+            num_videos_per_prompt,
+            num_channels_latents,
+            1,
+            height // vae_scale_factor,
+            width // vae_scale_factor,
+        )
+        latents_noise_list = []
         for i in range(latent_video_length):
-            latents.append(randn_tensor(shape_or_frame, generator=generator, device=device, dtype=dit_dtype))
-        latents = torch.cat(latents, dim=2)
+            latents_noise_list.append(
+                randn_tensor(shape_or_frame, generator=generator, device=device, dtype=dit_dtype)
+            )
+        latents_noise = torch.cat(latents_noise_list, dim=2)
+        
+        # NEW: if pose guidance is enabled, load and encode pose maps, then add (weighted) to noise
+        if args.use_pose:
+            if args.pose_path is None:
+                raise ValueError("Pose guidance enabled but no --pose_path provided.")
+            
+            # Reuse helper functions from dataset/image_video_dataset.py:
+            from dataset.image_video_dataset import load_video
+            
+            # load pose frames (assuming they are provided as images or as a video)
+            if os.path.isdir(args.pose_path):
+                pose_frames = load_images(args.pose_path, latent_video_length, bucket_reso=(width, height))
+            else:
+                pose_frames = load_video(args.pose_path, 0, latent_video_length, bucket_reso=(width, height))
+                
+            if len(pose_frames) < latent_video_length:
+                # pad missing frames by repeating the last frame
+                missing = latent_video_length - len(pose_frames)
+                pose_frames = pose_frames + [pose_frames[-1]] * missing
+            else:
+                pose_frames = pose_frames[:latent_video_length]
+            
+            # Convert each pose frame (a numpy array of shape [H, W, C]) to a torch tensor in shape [C, H, W]
+            pose_tensor_list = []
+            for frame in pose_frames:
+                tensor = torch.from_numpy(frame).permute(2, 0, 1)
+                pose_tensor_list.append(tensor)
+            # Stack into (T, C, H, W)
+            pose_tensor = torch.stack(pose_tensor_list, dim=0)
+            # Add a batch dimension for one video --> (1, T, C, H, W)
+            pose_tensor = pose_tensor.unsqueeze(0)
+            # Rearrange to have channels first: (1, C, T, H, W)
+            pose_tensor = pose_tensor.permute(0, 2, 1, 3, 4).to(device, dtype=vae_dtype)
+            # Normalize as in cache_latents.py (images are in [0,255])
+            pose_tensor = pose_tensor.float() / 127.5 - 1.0
+            # Convert to half (torch.float16)
+            pose_tensor = pose_tensor.half().to(device)
+
+            with torch.no_grad():
+                z_pose = vae.encode(pose_tensor).latent_dist.sample()
+            # z_pose will have shape (1, 16, latent_video_length, H/vae_scale_factor, W/vae_scale_factor)
+            # Combine with noise
+            pose_alpha = args.pose_alpha
+            latents = latents_noise + (pose_alpha * z_pose)
+        else:
+            latents = latents_noise
 
         if args.video_path is not None:
             # v2v inference

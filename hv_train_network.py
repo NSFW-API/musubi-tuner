@@ -32,7 +32,7 @@ from diffusers.optimization import (
     TYPE_TO_SCHEDULER_FUNCTION as DIFFUSERS_TYPE_TO_SCHEDULER_FUNCTION,
 )
 from transformers.optimization import SchedulerType, TYPE_TO_SCHEDULER_FUNCTION
-
+from diffusers.utils.torch_utils import randn_tensor
 from dataset import config_utils
 from hunyuan_model.models import load_transformer, get_rotary_pos_embed_by_shape, HYVideoDiffusionTransformer
 import hunyuan_model.text_encoder as text_encoder_module
@@ -388,19 +388,20 @@ def sample_images(accelerator, args, epoch, steps, vae, transformer, sample_para
 
 
 def sample_image_inference(accelerator, args, transformer, dit_dtype, vae, save_dir, sample_parameter, epoch, steps):
-    sample_steps = sample_parameter.get("sample_steps", 20)
-    width = sample_parameter.get("width", 256)  # make smaller for faster and memory saving inference
+    # Retrieve prompt and sampling parameters.
+    num_videos_per_prompt = sample_parameter.get("num_videos_per_prompt", 1)
+    width = sample_parameter.get("width", 256)
     height = sample_parameter.get("height", 256)
     frame_count = sample_parameter.get("frame_count", 1)
     guidance_scale = sample_parameter.get("guidance_scale", 6.0)
     discrete_flow_shift = sample_parameter.get("discrete_flow_shift", 14.5)
     seed = sample_parameter.get("seed")
-    prompt: str = sample_parameter.get("prompt", "")
-
-    # Calculate latent video length based on VAE version
-    if "884" in VAE_VER:
+    prompt = sample_parameter.get("prompt", "")
+    
+    # Determine latent video length.
+    if "884" in vae.config._class_name:
         latent_video_length = (frame_count - 1) // 4 + 1
-    elif "888" in VAE_VER:
+    elif "888" in vae.config._class_name:
         latent_video_length = (frame_count - 1) // 8 + 1
     else:
         latent_video_length = frame_count
@@ -411,61 +412,80 @@ def sample_image_inference(accelerator, args, transformer, dit_dtype, vae, save_
         torch.cuda.manual_seed(seed)
         generator = torch.Generator(device=device).manual_seed(seed)
     else:
-        # True random sample image generation
-        torch.seed()
-        torch.cuda.seed()
         generator = torch.Generator(device=device).manual_seed(torch.initial_seed())
-
-    logger.info(f"prompt: {prompt}")
-    logger.info(f"height: {height}")
-    logger.info(f"width: {width}")
-    logger.info(f"frame count: {frame_count}")
-    logger.info(f"sample steps: {sample_steps}")
-    logger.info(f"guidance scale: {guidance_scale}")
-    logger.info(f"discrete flow shift: {discrete_flow_shift}")
-    if seed is not None:
-        logger.info(f"seed: {seed}")
-
-    # Prepare scheduler for each prompt
+    
+    # Log prompt info.
+    import time, logging
+    logger = logging.getLogger(__name__)
+    logger.info(f"Sampling prompt: {prompt}")
+    logger.info(f"width: {width}, height: {height}, frame_count: {frame_count}, sample_steps: {sample_parameter.get('sample_steps',10)}")
+    
+    # Prepare scheduler: (ensure your scheduler is imported correctly)
+    from modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
     scheduler = FlowMatchDiscreteScheduler(shift=discrete_flow_shift, reverse=True, solver="euler")
-
-    # Number of inference steps for sampling
+    sample_steps = sample_parameter.get("sample_steps", 10)
     scheduler.set_timesteps(sample_steps, device=device)
     timesteps = scheduler.timesteps
 
-    # Get embeddings
-    prompt_embeds = sample_parameter["llm_embeds"].to(device=device, dtype=dit_dtype)
-    prompt_mask = sample_parameter["llm_mask"].to(device=device)
-    prompt_embeds_2 = sample_parameter["clipL_embeds"].to(device=device, dtype=dit_dtype)
-
-    num_channels_latents = 16  # transformer.config.in_channels
-    vae_scale_factor = 2 ** (4 - 1)  # Assuming 4 VAE blocks
-
-    # Initialize latents
+    # Build the latent noise tensor.
+    # Instead of using vae.config.scaling_factor (which is a float and can lead to non-integer size),
+    # we use the VAE's spatial compression ratio.
+    comp_ratio = vae.config.spatial_compression_ratio  # e.g. 8
+    latent_height = int(height) // comp_ratio   # For 256, this will be 32 (if comp_ratio==8)
+    latent_width  = int(width)  // comp_ratio
+    num_channels_latents = 16  # typically transformer.config.in_channels
     shape_or_frame = (
-        1,
-        num_channels_latents,
-        1,
-        height // vae_scale_factor,
-        width // vae_scale_factor,
+         num_videos_per_prompt,
+         num_channels_latents,
+         1,
+         latent_height,
+         latent_width,
     )
-    latents = []
-    for _ in range(latent_video_length):
-        latents.append(torch.randn(shape_or_frame, generator=generator, device=device, dtype=dit_dtype))
-    latents = torch.cat(latents, dim=2)
+    # Generate latent noise for each frame.
+    from diffusers.utils.torch_utils import randn_tensor
+    latents_noise_list = []
+    for i in range(latent_video_length):
+        noise_frame = randn_tensor(shape_or_frame, generator=generator, device=device, dtype=dit_dtype)
+        latents_noise_list.append(noise_frame)
+    # Concatenate along the temporal dimension (dim=2)
+    latents_noise = torch.cat(latents_noise_list, dim=2)  # Final shape: (num_videos_per_prompt, 16, latent_video_length, latent_height, latent_width)
+    
+    # NEW: If a cached pose latent file is provided via --pose, load and combine it.
+    if args.pose is not None:
+        from safetensors.torch import load_file
+        pose_latent = load_file(args.pose)["latent"].to(device, dtype=dit_dtype)
+        # Ensure pose_latent has batch dimension.
+        if pose_latent.ndim == 4:
+            pose_latent = pose_latent.unsqueeze(0)  # Now shape: (1, C, F, H, W)
+        # Ensure the spatio-temporal dimensions match.
+        # We expect latents_noise shape's last three dims: (latent_video_length, latent_height, latent_width)
+        target_shape = latents_noise.shape[-3:]  # (F, H, W)
+        if pose_latent.shape[-3:] != target_shape:
+            # Use trilinear interpolation to match (works for 5D tensors: batch, channels, depth, height, width)
+            pose_latent = torch.nn.functional.interpolate(pose_latent, size=target_shape, mode="trilinear", align_corners=False)
+        latents = latents_noise + args.pose_alpha * pose_latent
+    else:
+        latents = latents_noise
 
-    # Guidance scale
+    # Prepare guidance scale.
     guidance_expand = torch.tensor([guidance_scale * 1000.0], dtype=torch.float32, device=device).to(dit_dtype)
-
-    # Get rotary positional embeddings
+    
+    # Obtain rotary positional embeddings.
+    # Make sure get_rotary_pos_embed_by_shape() is imported.
     freqs_cos, freqs_sin = get_rotary_pos_embed_by_shape(transformer, latents.shape[2:])
     freqs_cos = freqs_cos.to(device=device, dtype=dit_dtype)
     freqs_sin = freqs_sin.to(device=device, dtype=dit_dtype)
-
-    # Wrap the inner loop with tqdm to track progress over timesteps
+    
+    # Retrieve additional embeddings.
+    prompt_embeds = sample_parameter["llm_embeds"].to(device=device, dtype=dit_dtype)
+    prompt_mask   = sample_parameter["llm_mask"].to(device=device)
+    prompt_embeds_2 = sample_parameter["clipL_embeds"].to(device=device, dtype=dit_dtype)
+    
     prompt_idx = sample_parameter.get("enum", 0)
+    # Inner sampling loop over timesteps.
+    from tqdm import tqdm
     with torch.no_grad():
-        for i, t in enumerate(tqdm(timesteps, desc=f"Sampling timesteps for prompt {prompt_idx+1}")):
+        for i, t in enumerate(tqdm(timesteps, desc=f"Sampling for prompt {prompt_idx+1}")):
             latents = scheduler.scale_model_input(latents, t)
             noise_pred = transformer(
                 latents,
@@ -478,37 +498,32 @@ def sample_image_inference(accelerator, args, transformer, dit_dtype, vae, save_
                 guidance=guidance_expand,
                 return_dict=True,
             )["x"]
-
-            # Compute the previous noisy sample x_t -> x_t-1
             latents = scheduler.step(noise_pred, t, latents, return_dict=False)[0]
 
-    # Move VAE to the appropriate device for sampling
+    # Decode latents to video using the VAE.
     vae.to(device)
     vae.eval()
-
-    # Decode latents to video
     if hasattr(vae.config, "shift_factor") and vae.config.shift_factor:
+        # Some VAE models output latent that need shifting; adjust as appropriate.
         latents = latents / vae.config.scaling_factor + vae.config.shift_factor
     else:
         latents = latents / vae.config.scaling_factor
-
     latents = latents.to(device=device, dtype=vae.dtype)
     with torch.no_grad():
         video = vae.decode(latents, return_dict=False)[0]
     video = (video / 2 + 0.5).clamp(0, 1)
     video = video.cpu().float()
-
-    # Save video
+    
+    # Save video (or image grid) to disk.
     ts_str = time.strftime("%Y%m%d%H%M%S", time.localtime())
     num_suffix = f"e{epoch:06d}" if epoch is not None else f"{steps:06d}"
     seed_suffix = "" if seed is None else f"_{seed}"
     save_path = f"{'' if args.output_name is None else args.output_name + '_'}{num_suffix}_{prompt_idx:02d}_{ts_str}{seed_suffix}"
+    # Use your functions save_videos_grid or save_images_grid as appropriate.
     if video.shape[2] == 1:
-        save_images_grid(video, save_dir, save_path, create_subdir=False)
+        save_images_grid(video, os.path.join(save_dir, save_path), create_subdir=False)
     else:
         save_videos_grid(video, os.path.join(save_dir, save_path) + ".mp4")
-
-    # Move models back to initial state
     vae.to("cpu")
 
 
@@ -2318,6 +2333,10 @@ def setup_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="upload to huggingface asynchronously / huggingfaceに非同期でアップロードする",
     )
+    
+    parser.add_argument("--use_pose", action="store_true", help="Enable pose guidance injection")
+    parser.add_argument("--pose", type=str, default=None, help="Path to a cached pose latent file for sampling")
+    parser.add_argument("--pose_alpha", type=float, default=1.0, help="Scaling factor to weight the pose latent injection (default: 1.0)")
 
     return parser
 
