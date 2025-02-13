@@ -388,10 +388,32 @@ def sample_images(accelerator, args, epoch, steps, vae, transformer, sample_para
     clean_memory_on_device(accelerator.device)
 
 
-def sample_image_inference(accelerator, args, transformer, dit_dtype, vae, save_dir, sample_parameter, epoch, steps):
-    # Retrieve prompt and sampling parameters.
-    num_videos_per_prompt = sample_parameter.get("num_videos_per_prompt", 1)
+def sample_image_inference(
+    accelerator, args, transformer, dit_dtype, vae, save_dir, sample_parameter, epoch, steps
+):
+    logger = logging.getLogger(__name__)
+    logger.info("Entering sample_image_inference()")
     
+    # Show what args.dit_dtype is before we do anything
+    logger.info(f"args.dit_dtype is: {args.dit_dtype!r}")
+    
+    # Convert string => torch.dtype (if needed):
+    if args.dit_dtype is not None:
+        # Log the pre-conversion str
+        logger.info(f"Converting string '{args.dit_dtype}' to real torch.dtype")
+        real_dit_dtype = str_to_dtype(args.dit_dtype)
+        logger.info(f"str_to_dtype('{args.dit_dtype}') => {real_dit_dtype}")
+        dit_dtype = real_dit_dtype
+    else:
+        # Default to bfloat16 if not given
+        dit_dtype = torch.bfloat16
+        logger.info("args.dit_dtype is None; defaulting to torch.bfloat16")
+    
+    # Just to double-check
+    logger.info(f"Final dit_dtype (should be a torch.dtype): {dit_dtype}")
+    
+    # Retrieve prompt and sampling parameters
+    num_videos_per_prompt = sample_parameter.get("num_videos_per_prompt", 1)
     width = sample_parameter.get("width", 272)
     height = sample_parameter.get("height", 480)
     frame_count = sample_parameter.get("frame_count", 1)
@@ -400,148 +422,191 @@ def sample_image_inference(accelerator, args, transformer, dit_dtype, vae, save_
     seed = sample_parameter.get("seed")
     prompt = sample_parameter.get("prompt", "")
     
-    # Determine latent video length.
+    # Determine latent video length
     if "884" in vae.config._class_name:
         latent_video_length = (frame_count - 1) // 4 + 1
     elif "888" in vae.config._class_name:
         latent_video_length = (frame_count - 1) // 8 + 1
     else:
         latent_video_length = frame_count
-
+    
     device = accelerator.device
     if seed is not None:
         torch.manual_seed(seed)
         torch.cuda.manual_seed(seed)
         generator = torch.Generator(device=device).manual_seed(seed)
+        logger.info(f"Set manual seed to {seed}")
     else:
         generator = torch.Generator(device=device).manual_seed(torch.initial_seed())
+        logger.info(f"No explicit seed; using torch.initial_seed() => {torch.initial_seed()}")
     
-    # Log prompt info.
-    import time, logging
-    logger = logging.getLogger(__name__)
     logger.info(f"Sampling prompt: {prompt}")
-    logger.info(f"width: {width}, height: {height}, frame_count: {frame_count}, sample_steps: {sample_parameter.get('sample_steps',10)}")
+    logger.info(f"width={width}, height={height}, frame_count={frame_count}, sample_steps={sample_parameter.get('sample_steps', 10)}")
     
-    # Prepare scheduler: (ensure your scheduler is imported correctly)
-    from modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
+    # Prepare scheduler
+    logger.info("Creating FlowMatchDiscreteScheduler")
     scheduler = FlowMatchDiscreteScheduler(shift=discrete_flow_shift, reverse=True, solver="euler")
     sample_steps = sample_parameter.get("sample_steps", 10)
     scheduler.set_timesteps(sample_steps, device=device)
     timesteps = scheduler.timesteps
-
-    # Build the latent noise tensor.
-    # Instead of using vae.config.scaling_factor (which is a float and can lead to non-integer size),
-    # we use the VAE's spatial compression ratio.
-    comp_ratio = vae.config.spatial_compression_ratio  # e.g. 8
-    latent_height = int(height) // comp_ratio   # For 256, this will be 32 (if comp_ratio==8)
-    latent_width  = int(width)  // comp_ratio
-    num_channels_latents = 16  # typically transformer.config.in_channels
+    logger.info(f"Prepared scheduler with sample_steps={sample_steps}; timesteps={timesteps}")
+    
+    # Build the latent noise tensor
+    comp_ratio = vae.config.spatial_compression_ratio
+    latent_height = int(height) // comp_ratio
+    latent_width = int(width) // comp_ratio
+    num_channels_latents = 16
     shape_or_frame = (
-         num_videos_per_prompt,
-         num_channels_latents,
-         1,
-         latent_height,
-         latent_width,
+        num_videos_per_prompt,
+        num_channels_latents,
+        1,
+        latent_height,
+        latent_width,
     )
-    # Generate latent noise for each frame.
-    from diffusers.utils.torch_utils import randn_tensor
+    logger.info(f"VAE comp_ratio={comp_ratio}, shape for each frame={shape_or_frame}, total frames={latent_video_length}")
+    
     latents_noise_list = []
     for i in range(latent_video_length):
         noise_frame = randn_tensor(shape_or_frame, generator=generator, device=device, dtype=dit_dtype)
         latents_noise_list.append(noise_frame)
-    # Concatenate along the temporal dimension (dim=2)
-    latents_noise = torch.cat(latents_noise_list, dim=2)  # Final shape: (num_videos_per_prompt, 16, latent_video_length, latent_height, latent_width)
+    latents_noise = torch.cat(latents_noise_list, dim=2)
+    logger.info(f"Built noise latents shape={latents_noise.shape}, dtype={latents_noise.dtype}")
     
-    # NEW: If a cached pose latent file is provided via --pose, load and combine it.
+    # Maybe store pose_latent for logging if needed
+    pose_latent = None
     if args.pose is not None:
         from safetensors.torch import load_file
+        logger.info(f"Loading pose from {args.pose}")
         pose_data = load_file(args.pose)
-        print("Loaded pose file keys:", pose_data.keys())
-        print("Loaded pose latent shape BEFORE unsqueeze:", pose_data["latent"].shape)
+        logger.info(f"Pose file keys: {pose_data.keys()}")
+        
         pose_latent = pose_data["latent"].to(device, dtype=dit_dtype)
+        logger.info(f"Pose latent after .to(device, dtype=dit_dtype) => shape={pose_latent.shape}, dtype={pose_latent.dtype}")
+        
         if pose_latent.ndim == 4:
-            pose_latent = pose_latent.unsqueeze(0)  # Now shape: (1, C, F, H, W)
-        print("Pose latent shape AFTER unsqueeze:", pose_latent.shape)
-        # Ensure the spatial-temporal dimensions match.
-        target_shape = latents_noise.shape[-3:]  # (F, H, W)
+            pose_latent = pose_latent.unsqueeze(0)
+            logger.info(f"Pose latent unsqueezed => shape={pose_latent.shape}")
+        
+        target_shape = latents_noise.shape[-3:]
         if pose_latent.shape[-3:] != target_shape:
-            pose_latent = torch.nn.functional.interpolate(pose_latent, size=target_shape, mode="trilinear", align_corners=False)
+            logger.info(f"Interpolating pose latent from {pose_latent.shape[-3:]} => {target_shape}")
+            pose_latent = torch.nn.functional.interpolate(
+                pose_latent, size=target_shape, mode="trilinear", align_corners=False
+            )
+        
+        logger.info(f"Final pose_latent shape={pose_latent.shape}, dtype={pose_latent.dtype}")
         latents = latents_noise + args.pose_alpha * pose_latent
     else:
         latents = latents_noise
-
-    # Prepare guidance scale.
-    guidance_expand = torch.tensor([guidance_scale * 1000.0], dtype=torch.float32, device=device).to(dit_dtype)
     
-    # Obtain rotary positional embeddings.
-    # Make sure get_rotary_pos_embed_by_shape() is imported.
+    guidance_expand = torch.tensor([guidance_scale * 1000.0], dtype=torch.float32, device=device).to(dit_dtype)
+    logger.info(f"Guidance expand shape={guidance_expand.shape}, dtype={guidance_expand.dtype}, data={guidance_expand}")
+    
+    # Obtain rotary pos embeddings
     freqs_cos, freqs_sin = get_rotary_pos_embed_by_shape(transformer, latents.shape[2:])
     freqs_cos = freqs_cos.to(device=device, dtype=dit_dtype)
     freqs_sin = freqs_sin.to(device=device, dtype=dit_dtype)
+    logger.info(f"freqs_cos shape={freqs_cos.shape}, dtype={freqs_cos.dtype}; freqs_sin shape={freqs_sin.shape}, dtype={freqs_sin.dtype}")
     
-    # Retrieve additional embeddings.
+    # Retrieve additional embeddings
     prompt_embeds = sample_parameter["llm_embeds"].to(device=device, dtype=dit_dtype)
-    prompt_mask   = sample_parameter["llm_mask"].to(device=device)
+    prompt_mask = sample_parameter["llm_mask"].to(device=device)
     prompt_embeds_2 = sample_parameter["clipL_embeds"].to(device=device, dtype=dit_dtype)
+    logger.info(f"prompt_embeds shape={prompt_embeds.shape}, dtype={prompt_embeds.dtype}")
+    logger.info(f"prompt_mask shape={prompt_mask.shape}, dtype={prompt_mask.dtype}")
+    logger.info(f"prompt_embeds_2 shape={prompt_embeds_2.shape}, dtype={prompt_embeds_2.dtype}")
     
     prompt_idx = sample_parameter.get("enum", 0)
-    # Inner sampling loop over timesteps.
+    logger.info(f"Beginning diffusion sampling; timesteps={timesteps}, len={len(timesteps)}")
+    
+    def get_pose_alpha(step, total_steps, start=1.0, end=0.0):
+        if total_steps <= 1:
+            return start
+        return start + (end - start) * (step / float(total_steps - 1))
+    
+    latents = latents.clone()
+    
     from tqdm import tqdm
     with torch.no_grad():
-        def get_pose_alpha(step, total_steps, start=1.0, end=0.0):
-            if total_steps <= 1:
-                return start
-            return start + (end - start) * (step / float(total_steps - 1))
-
-        latents = latents_noise.clone()
-
-        for i, t in enumerate(timesteps):
-            # fraction of the way through the diffusion steps:
+        for i, t in enumerate(tqdm(timesteps, desc=f"Sampling prompt_idx={prompt_idx}")):
             alpha_t = get_pose_alpha(i, len(timesteps), start=args.pose_alpha, end=0.0)
-
-            # (optional) re-add the skeleton for this step:
-            latents_step = latents + alpha_t * pose_latent
-
-            # pass this step’s latents into the model
+            
+            # Re-add skeleton if we do pose injection
+            if pose_latent is not None:
+                latents_step = latents + alpha_t * pose_latent
+            else:
+                latents_step = latents
+            
+            # Log shapes/dtypes at each step if needed
+            logger.info(
+                f"Step {i}: alpha_t={alpha_t:.4f}, latents_step shape={latents_step.shape}, dtype={latents_step.dtype}, t={t}"
+            )
+            
             latents_step = scheduler.scale_model_input(latents_step, t)
+            
+            # If for some reason t is still a python scalar or if dtype is str:
+            logger.info(f" t.repeat => {t.repeat(latents_step.shape[0])}, device={device}, dtype={dit_dtype}")
+            time_tensor = t.repeat(latents_step.shape[0]).to(device=device, dtype=dit_dtype)
+            logger.info(f" time_tensor shape={time_tensor.shape}, dtype={time_tensor.dtype}, data={time_tensor}")
+            
+            # Now call the transformer
             noise_pred = transformer(
                 latents_step,
-                t.repeat(latents_step.shape[0]).to(device, dtype=dit_dtype),
+                time_tensor,
                 text_states=prompt_embeds,
                 text_mask=prompt_mask,
                 text_states_2=prompt_embeds_2,
                 freqs_cos=freqs_cos,
                 freqs_sin=freqs_sin,
                 guidance=guidance_expand,
-                return_dict=True,
-            )["x"]
-            latents = scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+                return_dict=False,
+            )
+            
+            B, _, T_final, H_final, W_final = latents.shape
+            T_token = T_final
+            H_token = H_final // 2
+            W_token = W_final // 2
 
-    # Decode latents to video using the VAE.
+            noise_pred_unpatched = transformer.unpatchify(noise_pred, T_token, H_token, W_token)
+            
+            logger.info(f"noise_pred shape={noise_pred.shape}, dtype={noise_pred.dtype}")
+            
+            latents = scheduler.step(noise_pred_unpatched, t, latents, return_dict=False)[0]
+    
+    # Decode latents
+    logger.info("Decoding latents...")
     vae.to(device)
     vae.eval()
     if hasattr(vae.config, "shift_factor") and vae.config.shift_factor:
-        # Some VAE models output latent that need shifting; adjust as appropriate.
         latents = latents / vae.config.scaling_factor + vae.config.shift_factor
     else:
         latents = latents / vae.config.scaling_factor
     latents = latents.to(device=device, dtype=vae.dtype)
+    logger.info(f"After scaling, latents shape={latents.shape}, dtype={latents.dtype}")
+    
     with torch.no_grad():
         video = vae.decode(latents, return_dict=False)[0]
     video = (video / 2 + 0.5).clamp(0, 1)
     video = video.cpu().float()
+    logger.info(f"Decoded video shape={video.shape}, dtype={video.dtype}")
     
-    # Save video (or image grid) to disk.
+    # Save video or image
+    import time, os
     ts_str = time.strftime("%Y%m%d%H%M%S", time.localtime())
     num_suffix = f"e{epoch:06d}" if epoch is not None else f"{steps:06d}"
     seed_suffix = "" if seed is None else f"_{seed}"
-    save_path = f"{'' if args.output_name is None else args.output_name + '_'}{num_suffix}_{prompt_idx:02d}_{ts_str}{seed_suffix}"
-    # Use your functions save_videos_grid or save_images_grid as appropriate.
+    save_path = (
+        f"{'' if args.output_name is None else args.output_name + '_'}{num_suffix}_{prompt_idx:02d}_{ts_str}{seed_suffix}"
+    )
+    
+    # Save the final result
     if video.shape[2] == 1:
         save_images_grid(video, os.path.join(save_dir, save_path), create_subdir=False)
     else:
         save_videos_grid(video, os.path.join(save_dir, save_path) + ".mp4")
+    logger.info(f"Saved result to {save_path}")
     vae.to("cpu")
+    logger.info("Exiting sample_image_inference()")
 
 
 class NetworkTrainer:
