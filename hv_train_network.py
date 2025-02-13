@@ -34,12 +34,13 @@ from diffusers.optimization import (
 from transformers.optimization import SchedulerType, TYPE_TO_SCHEDULER_FUNCTION
 from diffusers.utils.torch_utils import randn_tensor
 from dataset import config_utils
-from hunyuan_model.models import load_transformer, get_rotary_pos_embed_by_shape, HYVideoDiffusionTransformer
+from hunyuan_model.models import load_transformer, get_rotary_pos_embed_by_shape, HYVideoDiffusionTransformer, DiffusionTransformerWithPose
 import hunyuan_model.text_encoder as text_encoder_module
 from hunyuan_model.vae import load_vae, VAE_VER
 import hunyuan_model.vae as vae_module
 from modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
 import networks.lora as lora_module
+from networks.pose_adapter import PoseAdapter
 from dataset.config_utils import BlueprintGenerator, ConfigSanitizer
 from hv_generate_video import save_images_grid, save_videos_grid
 
@@ -390,8 +391,9 @@ def sample_images(accelerator, args, epoch, steps, vae, transformer, sample_para
 def sample_image_inference(accelerator, args, transformer, dit_dtype, vae, save_dir, sample_parameter, epoch, steps):
     # Retrieve prompt and sampling parameters.
     num_videos_per_prompt = sample_parameter.get("num_videos_per_prompt", 1)
-    width = sample_parameter.get("width", 256)
-    height = sample_parameter.get("height", 256)
+    
+    width = sample_parameter.get("width", 272)
+    height = sample_parameter.get("height", 480)
     frame_count = sample_parameter.get("frame_count", 1)
     guidance_scale = sample_parameter.get("guidance_scale", 6.0)
     discrete_flow_shift = sample_parameter.get("discrete_flow_shift", 14.5)
@@ -453,15 +455,16 @@ def sample_image_inference(accelerator, args, transformer, dit_dtype, vae, save_
     # NEW: If a cached pose latent file is provided via --pose, load and combine it.
     if args.pose is not None:
         from safetensors.torch import load_file
-        pose_latent = load_file(args.pose)["latent"].to(device, dtype=dit_dtype)
-        # Ensure pose_latent has batch dimension.
+        pose_data = load_file(args.pose)
+        print("Loaded pose file keys:", pose_data.keys())
+        print("Loaded pose latent shape BEFORE unsqueeze:", pose_data["latent"].shape)
+        pose_latent = pose_data["latent"].to(device, dtype=dit_dtype)
         if pose_latent.ndim == 4:
             pose_latent = pose_latent.unsqueeze(0)  # Now shape: (1, C, F, H, W)
-        # Ensure the spatio-temporal dimensions match.
-        # We expect latents_noise shape's last three dims: (latent_video_length, latent_height, latent_width)
+        print("Pose latent shape AFTER unsqueeze:", pose_latent.shape)
+        # Ensure the spatial-temporal dimensions match.
         target_shape = latents_noise.shape[-3:]  # (F, H, W)
         if pose_latent.shape[-3:] != target_shape:
-            # Use trilinear interpolation to match (works for 5D tensors: batch, channels, depth, height, width)
             pose_latent = torch.nn.functional.interpolate(pose_latent, size=target_shape, mode="trilinear", align_corners=False)
         latents = latents_noise + args.pose_alpha * pose_latent
     else:
@@ -485,11 +488,25 @@ def sample_image_inference(accelerator, args, transformer, dit_dtype, vae, save_
     # Inner sampling loop over timesteps.
     from tqdm import tqdm
     with torch.no_grad():
-        for i, t in enumerate(tqdm(timesteps, desc=f"Sampling for prompt {prompt_idx+1}")):
-            latents = scheduler.scale_model_input(latents, t)
+        def get_pose_alpha(step, total_steps, start=1.0, end=0.0):
+            if total_steps <= 1:
+                return start
+            return start + (end - start) * (step / float(total_steps - 1))
+
+        latents = latents_noise.clone()
+
+        for i, t in enumerate(timesteps):
+            # fraction of the way through the diffusion steps:
+            alpha_t = get_pose_alpha(i, len(timesteps), start=args.pose_alpha, end=0.0)
+
+            # (optional) re-add the skeleton for this step:
+            latents_step = latents + alpha_t * pose_latent
+
+            # pass this step’s latents into the model
+            latents_step = scheduler.scale_model_input(latents_step, t)
             noise_pred = transformer(
-                latents,
-                t.repeat(latents.shape[0]).to(device=device, dtype=dit_dtype),
+                latents_step,
+                t.repeat(latents_step.shape[0]).to(device, dtype=dit_dtype),
                 text_states=prompt_embeds,
                 text_mask=prompt_mask,
                 text_states_2=prompt_embeds_2,
@@ -1103,6 +1120,12 @@ class NetworkTrainer:
                 print(line)
 
     def train(self, args):
+        
+        def get_pose_alpha(step, total_steps, start=1.0, end=0.0):
+            if total_steps <= 1:
+                return start
+            return start + (end - start) * (step / float(total_steps - 1))
+        
         # check required arguments
         if args.dataset_config is None:
             raise ValueError("dataset_config is required / dataset_configが必要です")
@@ -1139,17 +1162,16 @@ class NetworkTrainer:
         accelerator = prepare_accelerator(args)
         is_main_process = accelerator.is_main_process
 
-        # prepare dtype
-        weight_dtype = torch.float32
-        if args.mixed_precision == "fp16":
-            weight_dtype = torch.float16
-        elif args.mixed_precision == "bf16":
-            weight_dtype = torch.bfloat16
+        if args.dit_dtype is None:
+            default_dtype = torch.bfloat16  # normally, use bf16 if nothing is passed
+        else:
+            default_dtype = model_utils.str_to_dtype(args.dit_dtype)
 
-        # HunyuanVideo specific
-        dit_dtype = torch.bfloat16 if args.dit_dtype is None else model_utils.str_to_dtype(args.dit_dtype)
-        dit_weight_dtype = torch.float8_e4m3fn if args.fp8_base else dit_dtype
-        logger.info(f"DiT precision: {dit_dtype}, weight precision: {dit_weight_dtype}")
+        dit_dtype = default_dtype
+        dit_weight_dtype = dit_dtype
+
+        logger.info(f"Mixed precision: {args.mixed_precision}; dit_dtype: {dit_dtype}; transformer weight dtype (dit_weight_dtype): {dit_weight_dtype}")
+        logger.info(f"Mixed precision set to {args.mixed_precision} -- dit_dtype: {dit_dtype}, transformer weight dtype (dit_weight_dtype): {dit_weight_dtype}")
         vae_dtype = torch.float16 if args.vae_dtype is None else model_utils.str_to_dtype(args.vae_dtype)
 
         # get embedding for sampling images
@@ -1190,14 +1212,48 @@ class NetworkTrainer:
             raise ValueError(
                 f"either --sdpa, --flash-attn, --sage-attn or --xformers must be specified / --sdpa, --flash-attn, --sage-attn, --xformersのいずれかを指定してください"
             )
+
+        # Load DiT model using dit_weight_dtype for its weights.
         transformer = load_transformer(args.dit, attn_mode, args.split_attn, loading_device, dit_weight_dtype)
         transformer.eval()
-        transformer.requires_grad_(False)
+
+        # Create the pose adapter module.
+        injection_layers = [2, 5, 8]
+        pose_adapter = PoseAdapter(in_channels=16, out_channels=16, mid_channels=32, num_layers=3)
+        pose_adapter = pose_adapter.to(accelerator.device, dtype=dit_dtype)
+
+        # Wrap the base transformer with the pose adapter
+        transformer = DiffusionTransformerWithPose(transformer, pose_adapter, injection_layers)
+        transformer = transformer.to(accelerator.device, dtype=dit_weight_dtype)
+        transformer.pose_proj = transformer.pose_proj.to(accelerator.device, dtype=dit_weight_dtype)
+        transformer.reduce_proj = transformer.reduce_proj.to(accelerator.device, dtype=dit_weight_dtype)
+
+        for name, param in transformer.named_parameters():
+            logger.info(f"Transformer param: {name} is on device {param.device} with dtype {param.dtype}")
+
+        # Log the chosen types.
+        logger.info(f"[AFTER LOADING] Transformer weight dtype: {next(transformer.parameters()).dtype}")
+        logger.info(f"[AFTER LOADING] PoseAdapter first parameter dtype: {next(transformer.pose_adapter.parameters()).dtype}")
+        logger.info(f"[AFTER LOADING] Pose projection weight dtype: {transformer.pose_proj.weight.dtype}")
+        logger.info(f"[AFTER LOADING] Reduce projection weight dtype: {transformer.reduce_proj.weight.dtype}")
+
+        # Freeze the whole transformer first.
+        for param in transformer.parameters():
+            param.requires_grad = False
+        # Unfreeze only the parameters in the new adapter branch.
+        for name, param in transformer.pose_adapter.named_parameters():
+            param.requires_grad = True
+            logger.info(f"Unfreezing pose adapter parameter: {name}")
 
         if blocks_to_swap > 0:
             logger.info(f"enable swap {blocks_to_swap} blocks to CPU from device: {accelerator.device}")
-            transformer.enable_block_swap(blocks_to_swap, accelerator.device, supports_backward=True)
+            transformer.enable_block_swap(blocks_to_swap, accelerator.device, supports_backward=False)
             transformer.move_to_device_except_swap_blocks(accelerator.device)
+            transformer.prepare_block_swap_before_forward()
+        else:
+            logger.info(f"Moving and casting model to {accelerator.device} and {dit_weight_dtype}")
+            transformer.to(device=accelerator.device)
+
         if args.img_in_txt_in_offloading:
             logger.info("Enable offloading img_in and txt_in to CPU")
             transformer.enable_img_in_txt_in_offloading()
@@ -1339,13 +1395,29 @@ class NetworkTrainer:
 
         if blocks_to_swap > 0:
             transformer = accelerator.prepare(transformer, device_placement=[not blocks_to_swap > 0])
-            accelerator.unwrap_model(transformer).move_to_device_except_swap_blocks(accelerator.device)  # reduce peak memory usage
+            accelerator.unwrap_model(transformer).move_to_device_except_swap_blocks(accelerator.device)
             accelerator.unwrap_model(transformer).prepare_block_swap_before_forward()
         else:
             transformer = accelerator.prepare(transformer)
+        # After accelerator.prepare, force the adapter back to FP16
+        logger.info("Post-accelerator prepare: Recasting the pose adapter to dit_weight_dtype")
+        transformer.pose_adapter.to(dit_weight_dtype)
+        for name, module in transformer.pose_adapter.named_modules():
+            for pname, p in module.named_parameters(recurse=False):
+                logger.info(f"[Post-prepare] {name}.{pname} dtype: {p.dtype}")
+        
+        for m in transformer.pose_adapter.modules():
+            if hasattr(m, 'weight'):
+                m.weight.data = m.weight.data.to(dit_weight_dtype)
+            if hasattr(m, 'bias') and m.bias is not None:
+                m.bias.data = m.bias.data.to(dit_weight_dtype)
 
         network, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(network, optimizer, train_dataloader, lr_scheduler)
         training_model = network
+        
+        logger.info("Post-accelerator prepare:")
+        for name, param in transformer.named_parameters():
+            logger.info(f"{name}: device={param.device}, dtype={param.dtype}")
 
         if args.gradient_checkpointing:
             transformer.train()
@@ -1589,152 +1661,107 @@ class NetworkTrainer:
             accelerator.unwrap_model(network).on_epoch_start(transformer)
 
             for step, batch in enumerate(train_dataloader):
-                latents, llm_embeds, llm_mask, clip_embeds = batch
+                # Unpack your batch including pose tensor
+                latents, llm_embeds, llm_mask, clip_embeds, pose_tensor = batch  
                 bsz = latents.shape[0]
                 current_step.value = global_step
 
                 with accelerator.accumulate(training_model):
                     accelerator.unwrap_model(network).on_step_start()
-
+                    
+                    # Rescale latents.
                     latents = latents * vae_module.SCALING_FACTOR
 
-                    # Sample noise that we'll add to the latents
+                    # Sample noise for noise injection.
                     noise = torch.randn_like(latents)
-
-                    # calculate model input and timesteps
+                    
+                    # Compute the noisy model input and timesteps.
                     noisy_model_input, timesteps = self.get_noisy_model_input_and_timesteps(
                         args, noise, latents, noise_scheduler, accelerator.device, dit_dtype
                     )
-
                     weighting = compute_loss_weighting_for_sd3(
                         args.weighting_scheme, noise_scheduler, timesteps, accelerator.device, dit_dtype
                     )
-
-                    # ensure guidance_scale in args is float
-                    guidance_vec = torch.full((bsz,), float(args.guidance_scale), device=accelerator.device)  # , dtype=dit_dtype)
-
-                    # ensure the hidden state will require grad
-                    if args.gradient_checkpointing:
-                        noisy_model_input.requires_grad_(True)
-                        guidance_vec.requires_grad_(True)
-
-                    pos_emb_shape = latents.shape[1:]
-                    if pos_emb_shape not in pos_embed_cache:
-                        freqs_cos, freqs_sin = get_rotary_pos_embed_by_shape(transformer, latents.shape[2:])
-                        # freqs_cos = freqs_cos.to(device=accelerator.device, dtype=dit_dtype)
-                        # freqs_sin = freqs_sin.to(device=accelerator.device, dtype=dit_dtype)
-                        pos_embed_cache[pos_emb_shape] = (freqs_cos, freqs_sin)
+                    guidance_vec = torch.full((bsz,), float(args.guidance_scale), device=accelerator.device)
+                    
+                    # Compute pose strength (alpha) for this step.
+                    current_pose_alpha = get_pose_alpha(step, len(timesteps), start=args.pose_alpha, end=0.0)
+                                        
+                    logger.info(f"Raw pose tensor dtype: {pose_tensor.dtype}")
+                    pose_tensor_for_adapter = pose_tensor.to(device=accelerator.device, dtype=dit_dtype)
+                    logger.info(f"Converted pose tensor_for_adapter dtype: {pose_tensor_for_adapter.dtype}")
+                    
+                    # Use the same rotary embeddings as before.
+                    pos_shape = latents.shape[2:]  # (T, H, W)
+                    if pos_shape not in pos_embed_cache:
+                        freqs_cos, freqs_sin = get_rotary_pos_embed_by_shape(transformer, pos_shape)
+                        pos_embed_cache[pos_shape] = (freqs_cos, freqs_sin)
                     else:
-                        freqs_cos, freqs_sin = pos_embed_cache[pos_emb_shape]
+                        freqs_cos, freqs_sin = pos_embed_cache[pos_shape]
 
-                    # call DiT
-                    latents = latents.to(device=accelerator.device, dtype=network_dtype)
-                    noisy_model_input = noisy_model_input.to(device=accelerator.device, dtype=network_dtype)
-                    # timesteps = timesteps.to(device=accelerator.device, dtype=dit_dtype)
-                    # llm_embeds = llm_embeds.to(device=accelerator.device, dtype=dit_dtype)
-                    # llm_mask = llm_mask.to(device=accelerator.device)
-                    # clip_embeds = clip_embeds.to(device=accelerator.device, dtype=dit_dtype)
+                    logger.info(f"pose input dtype before adapter: {pose_tensor.dtype}")                    
+                    logger.info(f"Noisy model input dtype: {noisy_model_input.dtype}")
+                    logger.info(f"Text states (llm_embeds) dtype: {llm_embeds.dtype}")
+                    logger.info(f"Clip embeds (clip_embeds) dtype: {clip_embeds.dtype}")
+                    logger.info(f"Guidance vector dtype: {guidance_vec.dtype}")
+                    
                     with accelerator.autocast():
                         model_pred = transformer(
-                            noisy_model_input,
-                            timesteps,
+                            noisy_model_input,    # shape (B,16,T,H,W)
+                            timesteps,            # shape (B,)
                             text_states=llm_embeds,
+                            pose_input=pose_tensor_for_adapter, 
+                            pose_alpha=current_pose_alpha,
                             text_mask=llm_mask,
-                            text_states_2=clip_embeds,
+                            text_states_2=clip_embeds,  
                             freqs_cos=freqs_cos,
                             freqs_sin=freqs_sin,
-                            guidance=guidance_vec,
+                            guidance=guidance_vec, 
                             return_dict=False,
                         )
+                        
+                        logger.info(f"Transformer raw output dtype: {model_pred.dtype}")
 
-                    # flow matching loss
-                    target = noise - latents
+                    B, C_target, T_target, H_target, W_target = latents.shape  # target: [1, 16, 13, 42, 28]
+                    # For patch_size [1,2,2] we compute the token dimensions:
+                    T_token = T_target                     # = 13
+                    H_token = H_target // 2                # = 42//2 = 21
+                    W_token = W_target // 2                # = 28//2 = 14
 
-                    loss = torch.nn.functional.mse_loss(model_pred.to(network_dtype), target, reduction="none")
+                    # Use the transformer’s built‐in unpatchify function.
+                    model_pred_unpatched = transformer.unpatchify(model_pred, T_token, H_token, W_token)
 
+                    # Now compute loss between the unpatchified output and the target latents.
+                    target = (noise - latents).to(network_dtype) # Both shape: [B, 16, 13, 42, 28]
+                    loss = torch.nn.functional.mse_loss(model_pred_unpatched.to(network_dtype), target, reduction="none")
+                    loss = loss.mean()
                     if weighting is not None:
                         loss = loss * weighting
-                    # loss = loss.mean([1, 2, 3])
-                    # # min snr gamma, scale v pred loss like noise pred, v pred like loss, debiased estimation etc.
-                    # loss = self.post_process_loss(loss, args, timesteps, noise_scheduler)
+                    loss = loss.mean()       
 
-                    loss = loss.mean()  # 平均なのでbatch_sizeで割る必要なし
+                    progress_bar.set_postfix({"loss": loss})
+
+                    # Actually log the loss so that accelerate can send it to TensorBoard
+                    if len(accelerator.trackers) > 0:
+                        accelerator.log(
+                            {"train/loss": loss},
+                            step=global_step,  # This step is what shows up on the x-axis in TensorBoard
+                        )
 
                     accelerator.backward(loss)
-                    if accelerator.sync_gradients:
-                        # self.all_reduce_network(accelerator, network)  # sync DDP grad manually
-                        state = accelerate.PartialState()
-                        if state.distributed_type != accelerate.DistributedType.NO:
-                            for param in network.parameters():
-                                if param.grad is not None:
-                                    param.grad = accelerator.reduce(param.grad, reduction="mean")
-
-                        if args.max_grad_norm != 0.0:
-                            params_to_clip = accelerator.unwrap_model(network).get_trainable_params()
-                            accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
-
+                    # Optional: Clip gradients if needed.
+                    if accelerator.sync_gradients and args.max_grad_norm != 0.0:
+                        params_to_clip = accelerator.unwrap_model(network).get_trainable_params()
+                        accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+                    
                     optimizer.step()
                     lr_scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
-
-                if args.scale_weight_norms:
-                    keys_scaled, mean_norm, maximum_norm = accelerator.unwrap_model(network).apply_max_norm_regularization(
-                        args.scale_weight_norms, accelerator.device
-                    )
-                    max_mean_logs = {"Keys Scaled": keys_scaled, "Average key norm": mean_norm}
-                else:
-                    keys_scaled, mean_norm, maximum_norm = None, None, None
-
-                # Checks if the accelerator has performed an optimization step behind the scenes
+                
+                # Update gradient synchronization, logging and progress bar...
                 if accelerator.sync_gradients:
                     progress_bar.update(1)
                     global_step += 1
-
-                    # to avoid calling optimizer_eval_fn() too frequently, we call it only when we need to sample images or save the model
-                    should_sampling = should_sample_images(args, global_step, epoch=None)
-                    should_saving = args.save_every_n_steps is not None and global_step % args.save_every_n_steps == 0
-
-                    if should_sampling or should_saving:
-                        optimizer_eval_fn()
-                        if should_sampling:
-                            sample_images(accelerator, args, None, global_step, vae, transformer, sample_parameters, dit_dtype)
-
-                        if should_saving:
-                            accelerator.wait_for_everyone()
-                            if accelerator.is_main_process:
-                                ckpt_name = train_utils.get_step_ckpt_name(args.output_name, global_step)
-                                save_model(ckpt_name, accelerator.unwrap_model(network), global_step, epoch)
-
-                                if args.save_state:
-                                    train_utils.save_and_remove_state_stepwise(args, accelerator, global_step)
-
-                                remove_step_no = train_utils.get_remove_step_no(args, global_step)
-                                if remove_step_no is not None:
-                                    remove_ckpt_name = train_utils.get_step_ckpt_name(args.output_name, remove_step_no)
-                                    remove_model(remove_ckpt_name)
-                        optimizer_train_fn()
-
-                current_loss = loss.detach().item()
-                loss_recorder.add(epoch=epoch, step=step, loss=current_loss)
-                avr_loss: float = loss_recorder.moving_average
-                logs = {"avr_loss": avr_loss}  # , "lr": lr_scheduler.get_last_lr()[0]}
-                progress_bar.set_postfix(**logs)
-
-                if args.scale_weight_norms:
-                    progress_bar.set_postfix(**{**max_mean_logs, **logs})
-
-                if len(accelerator.trackers) > 0:
-                    logs = self.generate_step_logs(
-                        args, current_loss, avr_loss, lr_scheduler, lr_descriptions, optimizer, keys_scaled, mean_norm, maximum_norm
-                    )
-                    accelerator.log(logs, step=global_step)
-
-                if global_step >= args.max_train_steps:
-                    break
-
-            if len(accelerator.trackers) > 0:
-                logs = {"loss/epoch": loss_recorder.moving_average}
-                accelerator.log(logs, step=epoch + 1)
 
             accelerator.wait_for_everyone()
 

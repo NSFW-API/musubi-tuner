@@ -700,16 +700,16 @@ def main():
             
             # load pose frames (assuming they are provided as images or as a video)
             if os.path.isdir(args.pose_path):
-                pose_frames = load_images(args.pose_path, latent_video_length, bucket_reso=(width, height))
+                pose_frames = load_images(args.pose_path, args.video_length, bucket_reso=(width, height))
             else:
-                pose_frames = load_video(args.pose_path, 0, latent_video_length, bucket_reso=(width, height))
+                pose_frames = load_video(args.pose_path, 0, args.video_length, bucket_reso=(width, height))
                 
-            if len(pose_frames) < latent_video_length:
-                # pad missing frames by repeating the last frame
-                missing = latent_video_length - len(pose_frames)
+            # Now pad (if needed) so that you have args.video_length raw frames
+            if len(pose_frames) < args.video_length:
+                missing = args.video_length - len(pose_frames)
                 pose_frames = pose_frames + [pose_frames[-1]] * missing
             else:
-                pose_frames = pose_frames[:latent_video_length]
+                pose_frames = pose_frames[:args.video_length]
             
             # Convert each pose frame (a numpy array of shape [H, W, C]) to a torch tensor in shape [C, H, W]
             pose_tensor_list = []
@@ -770,33 +770,52 @@ def main():
         freqs_cos = freqs_cos.to(device=device, dtype=dit_dtype)
         freqs_sin = freqs_sin.to(device=device, dtype=dit_dtype)
 
+        def get_pose_alpha(step_idx: int, total_steps: int, start: float, end: float = 0.0) -> float:
+            """
+            Linearly decay the pose alpha from start to end over total_steps.
+            For step_idx==0 returns start, and for step_idx==total_steps-1 returns end.
+            """
+            if total_steps <= 1:
+                return start
+            alpha = start + (end - start) * (step_idx / (total_steps - 1))
+            return alpha
+
+
         num_warmup_steps = len(timesteps) - num_inference_steps * scheduler.order  # this should be 0 in v2v inference
         # with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]) as p:
         with tqdm(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
-                latents = scheduler.scale_model_input(latents, t)
-
-                # predict the noise residual
+                # Compute the current alpha using the declining schedule.
+                current_pose_alpha = get_pose_alpha(i, num_inference_steps, start=args.pose_alpha, end=0.0)
+                
+                # If pose guidance is enabled, add the (current_pose_alpha * z_pose) to the current latent.
+                if args.use_pose:
+                    # Note: You want to add the control signal at every denoising step.
+                    # Here we inject it into the latent before scaling.
+                    latents_with_pose = latents + (current_pose_alpha * z_pose)
+                else:
+                    latents_with_pose = latents
+                
+                # Scale the input of the model per the scheduler.
+                scaled_input = scheduler.scale_model_input(latents_with_pose, t)
+                
                 with torch.no_grad(), accelerator.autocast():
-                    noise_pred = transformer(  # For an input image (129, 192, 336) (1, 256, 256)
-                        latents,  # [1, 16, 33, 24, 42]
-                        t.repeat(latents.shape[0]).to(device=device, dtype=dit_dtype),  # [1]
-                        text_states=prompt_embeds,  # [1, 256, 4096]
-                        text_mask=prompt_mask,  # [1, 256]
-                        text_states_2=prompt_embeds_2,  # [1, 768]
-                        freqs_cos=freqs_cos,  # [seqlen, head_dim]
-                        freqs_sin=freqs_sin,  # [seqlen, head_dim]
+                    noise_pred = transformer(
+                        scaled_input,
+                        t.repeat(latents.shape[0]).to(device=device, dtype=dit_dtype),
+                        text_states=prompt_embeds,
+                        text_mask=prompt_mask,
+                        text_states_2=prompt_embeds_2,
+                        freqs_cos=freqs_cos,
+                        freqs_sin=freqs_sin,
                         guidance=guidance_expand,
                         return_dict=True,
                     )["x"]
-
-                # compute the previous noisy sample x_t -> x_t-1
+                
+                # Update the latents based on the noise prediction:
                 latents = scheduler.step(noise_pred, t, latents, return_dict=False)[0]
-
-                # update progress bar
-                if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % scheduler.order == 0):
-                    if progress_bar is not None:
-                        progress_bar.update()
+                
+                progress_bar.update()
 
         # print(p.key_averages().table(sort_by="self_cpu_time_total", row_limit=-1))
         # print(p.key_averages().table(sort_by="self_cuda_time_total", row_limit=-1))

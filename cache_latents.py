@@ -3,6 +3,7 @@ import os
 import glob
 from typing import Optional, Union, Tuple
 import numpy as np
+import cv2
 import torch
 from tqdm import tqdm
 from PIL import Image
@@ -25,46 +26,167 @@ logging.basicConfig(level=logging.INFO)
 # Initialize the DWpose detector once.
 pose_detector = DWposeDetector()
 
+def ensure_rgb(frame: np.ndarray) -> np.ndarray:
+    """
+    Ensure the input frame is an RGB image.
+    If the frame has more than 3 channels, take only the first 3.
+    Assumes frame is in shape (H, W, C) and in [0,255].
+    """
+    if frame.ndim != 3:
+        raise ValueError(f"Expected a 3D array for frame, got shape {frame.shape}")
+    if frame.shape[-1] != 3:
+        # If there are extra channels (e.g. 16) then just take the first three.
+        frame = frame[..., :3]
+    return frame
+
+def reduce_channels_to_rgb(pose_image: np.ndarray) -> np.ndarray:
+    """
+    In case DWpose returns something that is not 3 channels, convert it to an RGB image.
+    If the image has a different number of channels (but is 3D), we take the average
+    across channels and then stack that into three channels.
+    """
+    if pose_image.ndim == 3 and pose_image.shape[-1] != 3:
+        gray = np.mean(pose_image, axis=-1).clip(0, 255).astype(np.uint8)
+        pose_image = np.stack([gray, gray, gray], axis=-1)
+    return pose_image
+
+def advanced_pose_postprocess(
+    pose_image: np.ndarray,
+    background_color: tuple = (128, 128, 128),
+    line_color: tuple = (220, 220, 220),
+    unify_lines: bool = True,
+    do_blur: bool = True,
+    blur_ksize: int = 9,
+    blur_sigma: float = 3.0
+) -> np.ndarray:
+    """
+    Process a raw skeleton image:
+      1) Replace the black background (pixels whose sum is 0) with background_color.
+      2) Optionally unify all non-background (skeleton) pixels to a single line_color.
+      3) Optionally apply Gaussian blur to soften edges.
+    Expects input pose_image with shape (H, W, 3) in [0,255] (dtype uint8).
+    """
+    out = pose_image.copy()  # (H, W, 3)
+    
+    # Replace background: assume any pixel with sum==0 is background.
+    bg_mask = (out.sum(axis=-1) == 0)
+    out[bg_mask] = background_color
+    
+    # Optionally, unify non-background lines to the given line_color.
+    if unify_lines:
+        line_mask = ~bg_mask
+        out[line_mask] = line_color
+        
+    # Optionally, blur the image.
+    if do_blur:
+        # OpenCV operates in BGR by default.
+        out_bgr = cv2.cvtColor(out.astype(np.uint8), cv2.COLOR_RGB2BGR)
+        out_bgr = cv2.GaussianBlur(out_bgr, (blur_ksize, blur_ksize), blur_sigma)
+        out = cv2.cvtColor(out_bgr, cv2.COLOR_BGR2RGB)
+        
+    return out
+
 def get_pose_image(frame: np.ndarray) -> np.ndarray:
     """
-    Given a single frame, return the pose-processed image.
-    If the input frame has an extra batch dimension (shape (1, H, W, C)), squeeze it.
+    Given an input frame (assumed to be an RGB image in [0,255] with shape (H, W, C)),
+    ensure it has 3 channels, run DWpose, then postprocess the output.
+    Returns an RGB image (H, W, 3) in [0,255] (dtype uint8).
     """
-    if frame.ndim == 4 and frame.shape[0] == 1:
-        frame = np.squeeze(frame, axis=0)
-    return pose_detector(frame)
+    frame = ensure_rgb(frame)
+    raw_pose = pose_detector(frame)  # DWpose output; might not have exactly 3 channels
+    raw_pose = reduce_channels_to_rgb(raw_pose)
+    processed_pose = advanced_pose_postprocess(
+        raw_pose,
+        background_color=(128, 128, 128),
+        line_color=(220, 220, 220),
+        unify_lines=True,
+        do_blur=True,
+        blur_ksize=9,
+        blur_sigma=3.0
+    )
+    return processed_pose
 
-def encode_pose_sequence(vae: AutoencoderKLCausal3D, item: ItemInfo, bucket_reso: Tuple[int, int]) -> torch.Tensor:
+def encode_pose_sequence(
+    vae: AutoencoderKLCausal3D,
+    item: ItemInfo,
+    bucket_reso: tuple[int, int],
+    debug_pose_dir: str = None
+) -> torch.Tensor:
     """
-    Given item.content (a numpy array with shape (F, H, W, C) for a multi‑frame video or (H, W, C) for a single image),
-    apply DWposeDetector on each frame, stack the results, and reformat the tensor for the VAE.
-    Returns a tensor of pose images with final shape (1, C, F, H, W).
+    Process the video frames in item.content as follows:
+      1) Run get_pose_image() on each frame.
+      2) Optionally save each processed pose image for debugging.
+      3) Convert the processed image to a torch tensor (scaled to [-1, 1]).
+      4) Stack tensors over the time dimension.
+      5) Rearrange dimensions to (B, 3, F, H, W) which is then passed into the VAE.
+      6) VAE-encode the pose sequence and return the sampled latent.
+      
+    Logging is added to report shapes at every step.
     """
     frames = item.content
-    # If item.content is a single image, wrap it in a list
+    # Convert to list if multiple frames
     if frames.ndim == 3:
+        print(f"Single frame detected with shape: {frames.shape}")
         frames = [frames]
     elif frames.ndim == 4:
+        print(f"Multiple frames detected with shape: {frames.shape}")
         frames = list(frames)
     else:
         raise ValueError(f"Unsupported shape for item.content: {frames.shape}")
-    
-    pose_frames = []
-    for frame in frames:
-        # Make sure each frame is of shape (H, W, C)
-        processed = get_pose_image(frame)  # returns a numpy array (H, W, C)
-        pose_frames.append(torch.from_numpy(processed))
-    
-    # Stack along time: shape (F, H, W, C)
-    pose_seq = torch.stack(pose_frames, dim=0)
-    # Add batch dimension: becomes (1, F, H, W, C)
+
+    pose_tensors = []
+    for i, frame in enumerate(frames):
+        # Process the frame into a pose image (should have shape (H, W, 3))
+        pose_img = get_pose_image(frame)
+        print(f"Frame {i}: Raw pose image shape: {pose_img.shape}")
+
+        # Optionally, save processed pose image for debugging.
+        if debug_pose_dir is not None:
+            os.makedirs(debug_pose_dir, exist_ok=True)
+            base_stem = os.path.splitext(os.path.basename(item.latent_cache_path))[0]
+            debug_fname = f"{base_stem}_pose_{i:03d}.png"
+            debug_path = os.path.join(debug_pose_dir, debug_fname)
+            Image.fromarray(pose_img.astype(np.uint8)).save(debug_path)
+            print(f"Saved debug pose image to {debug_path}")
+
+        # Convert to torch tensor (from shape (H,W,3) -> (3,H,W)) and scale to [-1,1]
+        tensor_pose = torch.from_numpy(pose_img).permute(2, 0, 1).contiguous()
+        tensor_pose = tensor_pose.to(vae.device, dtype=vae.dtype) / 127.5 - 1.0
+        print(f"Frame {i}: Pose tensor shape after conversion: {tensor_pose.shape}")
+        pose_tensors.append(tensor_pose)
+
+    # Stack tensors along a new time dimension: (F, 3, H, W)
+    pose_seq = torch.stack(pose_tensors, dim=0).contiguous()
+    print(f"Stacked pose sequence shape (F, 3, H, W): {pose_seq.shape}")
+
+    # Add batch dimension -> (1, F, 3, H, W)
     pose_seq = pose_seq.unsqueeze(0)
-    # Permute to get shape (1, C, F, H, W)
-    pose_seq = pose_seq.permute(0, 4, 1, 2, 3).contiguous()
-    # Move to same device and dtype as the VAE; normalize [-1,1]
-    pose_seq = pose_seq.to(vae.device, dtype=vae.dtype)
-    pose_seq = pose_seq / 127.5 - 1.0
-    return pose_seq
+    # Permute to match VAE expectation: (1, 3, F, H, W)
+    pose_seq = pose_seq.permute(0, 2, 1, 3, 4).contiguous()
+    print(f"Pose sequence shape after permuting to (B, 3, F, H, W): {pose_seq.shape}")
+
+    # Pass the pose sequence through the VAE encoder.
+    with torch.no_grad():
+        # Note: Ensure that vae.encode() is being used so that the output is in latent space.
+        encoded = vae.encode(pose_seq)
+        latent = encoded.latent_dist.sample()
+    print(f"Encoded pose latent shape: {latent.shape}")
+
+    # Check if the latent's channel dimension matches our expected value (e.g., 16)
+    expected_channels = 16  # Adjust if your model should output a different number.
+    if latent.dim() == 5:
+        channels = latent.shape[1]
+    elif latent.dim() == 4:
+        # if already squeezed, assume first dimension is channel
+        channels = latent.shape[0]
+    else:
+        channels = None
+    if channels != expected_channels:
+        print(f"WARNING: Expected latent channel dimension {expected_channels} but got {channels}")
+    else:
+        print(f"Latent channel dimension as expected: {channels}")
+
+    return latent
 
 def save_pose_cache(item: ItemInfo, latent: torch.Tensor):
     """
@@ -92,7 +214,7 @@ def save_pose_cache(item: ItemInfo, latent: torch.Tensor):
     logger.info(f"Saved pose latent cache to: {pose_cache_path}")
 
 def encode_and_save_batch(vae: AutoencoderKLCausal3D, batch: list[ItemInfo], use_pose: bool = False):
-    # Process the existing video latent as in your original code:
+    # Process the video latent branch (appearance) as before:
     contents = torch.stack([torch.from_numpy(item.content) for item in batch])
     if len(contents.shape) == 4:
         # if content shape is (B, H, W, C), add a frame dimension:
@@ -109,9 +231,8 @@ def encode_and_save_batch(vae: AutoencoderKLCausal3D, batch: list[ItemInfo], use
     # NEW: if use_pose flag is set, process the pose branch:
     if use_pose:
         for item in batch:
-            pose_seq = encode_pose_sequence(vae, item, bucket_reso=item.original_size)
-            with torch.no_grad():
-                z_pose = vae.encode(pose_seq).latent_dist.sample()
+            # This call returns the pose latents
+            z_pose = encode_pose_sequence(vae, item, bucket_reso=item.original_size, debug_pose_dir=None)
             save_pose_cache(item, z_pose)
 
 def main(args):

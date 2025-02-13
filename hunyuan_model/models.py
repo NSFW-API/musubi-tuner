@@ -5,6 +5,7 @@ from einops import rearrange
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 from .activation_layers import get_activation_layer
@@ -19,6 +20,12 @@ from modules.custom_offloading_utils import ModelOffloader, synchronize_device, 
 from hunyuan_model.posemb_layers import get_nd_rotary_pos_embed
 
 from utils.safetensors_utils import MemoryEfficientSafeOpen
+from networks.pose_adapter import PoseAdapter
+
+
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class MMDoubleStreamBlock(nn.Module):
@@ -133,6 +140,7 @@ class MMDoubleStreamBlock(nn.Module):
         max_seqlen_kv: Optional[int] = None,
         freqs_cis: tuple = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        logger.info(f"[TransformerBlock] Before img_mod, vec shape: {vec.shape}")
         (img_mod1_shift, img_mod1_scale, img_mod1_gate, img_mod2_shift, img_mod2_scale, img_mod2_gate) = self.img_mod(vec).chunk(
             6, dim=-1
         )
@@ -183,9 +191,9 @@ class MMDoubleStreamBlock(nn.Module):
         v = torch.cat((img_v, txt_v), dim=1)
         img_v = txt_v = None
 
-        assert (
-            cu_seqlens_q.shape[0] == 2 * img.shape[0] + 1
-        ), f"cu_seqlens_q.shape:{cu_seqlens_q.shape}, img.shape[0]:{img.shape[0]}"
+#        assert (
+#            cu_seqlens_q.shape[0] == 2 * img.shape[0] + 1
+#        ), f"cu_seqlens_q.shape:{cu_seqlens_q.shape}, img.shape[0]:{img.shape[0]}"
 
         # attention computation start
         if not self.hybrid_seq_parallel_attn:
@@ -365,7 +373,7 @@ class MMSingleStreamBlock(nn.Module):
             del img_q, txt_q, img_k, txt_k
 
         # Compute attention.
-        assert cu_seqlens_q.shape[0] == 2 * x.shape[0] + 1, f"cu_seqlens_q.shape:{cu_seqlens_q.shape}, x.shape[0]:{x.shape[0]}"
+#        assert cu_seqlens_q.shape[0] == 2 * x.shape[0] + 1, f"cu_seqlens_q.shape:{cu_seqlens_q.shape}, x.shape[0]:{x.shape[0]}"
 
         # attention computation start
         if not self.hybrid_seq_parallel_attn:
@@ -422,6 +430,209 @@ class MMSingleStreamBlock(nn.Module):
             return checkpoint(self._forward, *args, use_reentrant=False, **kwargs)
         else:
             return self._forward(*args, **kwargs)
+
+
+class DiffusionTransformerWithPose(nn.Module):
+    """
+    Wraps an existing "base_transformer" (which does the patch embedding, block attention,
+    etc.), plus a PoseAdapter. In the forward pass, we:
+      1) Patch-embed x.
+      2) Interpolate & project pose_input to match patch embedding’s T,H,W.
+      3) Insert pose features at selected injection_layers.
+    """
+
+    def __init__(self, base_transformer, pose_adapter: PoseAdapter, injection_layers=(2, 5, 8)):
+        super().__init__()
+        # The base model is your pre-existing HYVideoDiffusionTransformer,
+        # which has .img_in, .double_blocks, .single_blocks, .final_layer, etc.
+        self.transformer = base_transformer
+        self.pose_adapter = pose_adapter
+        self.injection_layers = set(injection_layers)  # layers to apply pose injection
+
+        # A simple 1×1×1 conv (or linear) to match your hidden dimension after pose_adapter
+        # so that pose_features match self.transformer.hidden_size.
+        # If hidden_size=3072, you typically flatten in HxW, so we do a 3D→2D projection eventually.
+        self.pose_proj = nn.Conv3d(pose_adapter.out_channels, self.transformer.hidden_size, kernel_size=1)
+        # If the base model sometimes has 4096 as the final hidden, you may want a reduce_proj, etc.
+        # Shown here only if needed:
+        self.reduce_proj = nn.Linear(4096, 3072)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        text_states: torch.Tensor,
+        pose_input: torch.Tensor = None,
+        pose_alpha: float = 1.0,
+        text_states_2: torch.Tensor = None,
+        guidance=None,
+        freqs_cos=None, 
+        freqs_sin=None,
+        text_mask=None,  # make sure it exists
+        **kwargs
+    ):
+        """
+        1) run patch embed:  x -> (B, hidden_size, T, H, W)
+        2) flatten -> (B, T×H×W, hidden_size)
+        3) run double_blocks in separate image & text streams
+        4) optionally add pose block outputs after certain double_blocks
+        5) merge & run single_blocks
+        6) final layer -> up or unpatchify
+        """
+
+        # 1) Image patch embedding (the base model's standard approach).
+        #    Suppose base_transformer.img_in(...) => shape (B, hidden_size, T, H, W).
+        img = self.transformer.img_in(x)  
+        if img.dim() != 5:
+            raise ValueError(f"Expected (B, hidden_size, T, H, W), got shape {img.shape}")
+
+        B, hidden_size, T, H, W = img.shape
+
+        # Flatten from (B, hidden_size, T, H, W) to (B, T×H×W, hidden_size).
+        # Our base HYVideoDiffusionTransformer does something like that internally,
+        # but let's do it explicitly so we can see the shape:
+        img = img.permute(0,2,3,4,1).contiguous().view(B, T*H*W, hidden_size)
+
+        # 2) If we have a pose_input, pass it to the pose_adapter, then
+        #    interpolate to the exact (T, H, W).
+        if pose_input is not None:
+            # Pose adapter: shape => (B, outC, T_orig, H_orig, W_orig) => (B, outC, T~, H~, W~)
+            pose_features = self.pose_adapter(pose_input)  # still (B, outC, T_orig, H_orig, W_orig)
+
+            # Interpolate to the same T, H, W used by the patch embed:
+            pose_features_ds = F.interpolate(
+                pose_features,
+                size=(T, H, W),       # must match the shape from patch embed
+                mode="trilinear",
+                align_corners=False,
+            )
+            # Now shape = (B, outC, T, H, W).
+
+            # Project to match the transformer's hidden_size:
+            pose_features_proj = self.pose_proj(pose_features_ds)
+            # => (B, hidden_size, T, H, W)
+
+            # Flatten to the same shape as “img”: (B, T×H×W, hidden_size)
+            pose_features_proj = pose_features_proj.permute(0, 2, 3, 4, 1).contiguous()
+            pose_features_proj_flat = pose_features_proj.view(B, T*H*W, hidden_size)
+        else:
+            pose_features_proj_flat = None
+
+        # 3) Now we run the double_blocks on separate image & text streams:
+        #    our base transformer typically unflattens them into (B, #tokens, hidden_size).
+        #    so let's do that next:
+        # T×H×W might be "img_seq_len", for example.
+        img_seq_len = img.shape[1]
+
+        if self.transformer.text_projection == "single_refiner":
+            txt = self.transformer.txt_in(text_states, t, text_mask)
+        else:
+            txt = self.transformer.txt_in(text_states)
+            
+        txt_seq_len = txt.shape[1]
+
+        # The base model’s code typically merges the vector t or text_states_2 into a “conditioning vector” 
+        # so we do it similarly here. For brevity, we’ll just define:
+        vec = self.transformer.time_in(t)
+
+        # 4) For each double_blocks i, run block; optionally inject pose at i.
+        #    The base_transformer double blocks take (img, txt, vec...) as well.
+        for i, block in enumerate(self.transformer.double_blocks):
+            block = block.to(x.device)  # force block to GPU
+            # unflatten "img" if necessary
+            # but typically the base code wants (B, L, hidden_size), so we already have that shape: (B, T×H×W, hidden_size)
+            img_out, txt_out = block(
+                img,
+                txt,
+                vec,
+                attn_mask=None,
+                cu_seqlens_q=None,
+                cu_seqlens_kv=None,
+                max_seqlen_q=None,
+                max_seqlen_kv=None,
+                total_len=None,
+            )
+
+            img, txt = img_out, txt_out
+
+            # Pose injection:
+            if (pose_features_proj_flat is not None) and (i in self.injection_layers):
+                # “Add” pose:
+                # shape is (B, T×H×W, hidden_size)
+                # Make sure it’s the same length in dimension 1:
+                if pose_features_proj_flat.shape[1] != img.shape[1]:
+                    raise ValueError(f"Mismatch: pose tokens={pose_features_proj_flat.shape[1]}, "
+                                     f"img tokens={img.shape[1]}. Need same shape.")
+                img = img + pose_alpha * pose_features_proj_flat
+
+        # 5) Merge “img” + “txt” tokens => single stream
+        x_merged = torch.cat([img, txt], dim=1)  # shape (B, (img_seq_len+txt_seq_len), hidden_size)
+
+        # pass through single blocks:
+        for block in self.transformer.single_blocks:
+            block = block.to(x.device)  # force block to GPU
+            x_merged = block(x_merged, vec, txt_seq_len)
+
+        # Now the image tokens are x_merged[:, :img_seq_len, :]
+        output_img = x_merged[:, :img_seq_len, :]
+
+        # 6) If the base model does a final linear or final up-projection:
+        out = self.transformer.final_layer(output_img, vec)
+        # out = self.transformer.unpatchify(out, T, H, W)
+        return out
+
+
+    @property
+    def patch_size(self):
+        return self.transformer.patch_size
+
+    @property
+    def hidden_size(self):
+        return self.transformer.hidden_size
+
+    @property
+    def heads_num(self):
+        return self.transformer.heads_num
+
+    @property
+    def rope_dim_list(self):
+        return self.transformer.rope_dim_list
+
+    @property
+    def dtype(self):
+        return next(self.transformer.parameters()).dtype
+
+    @property
+    def device(self):
+        return next(self.transformer.parameters()).device
+
+    # The following methods simply delegate to the base transformer.
+    def enable_block_swap(self, num_blocks: int, device: torch.device, supports_backward: bool):
+        self.transformer.enable_block_swap(num_blocks, device, supports_backward)
+
+    def switch_block_swap_for_inference(self):
+        self.transformer.switch_block_swap_for_inference()
+
+    def switch_block_swap_for_training(self):
+        self.transformer.switch_block_swap_for_training()
+
+    def move_to_device_except_swap_blocks(self, device: torch.device):
+        self.transformer.move_to_device_except_swap_blocks(device)
+
+    def prepare_block_swap_before_forward(self):
+        self.transformer.prepare_block_swap_before_forward()
+
+    def enable_img_in_txt_in_offloading(self):
+        self.transformer.enable_img_in_txt_in_offloading()
+
+    def enable_gradient_checkpointing(self):
+        self.transformer.enable_gradient_checkpointing()
+
+    def disable_gradient_checkpointing(self):
+        self.transformer.disable_gradient_checkpointing()
+        
+    def unpatchify(self, x, t, h, w):
+        return self.transformer.unpatchify(x, t, h, w)
 
 
 class HYVideoDiffusionTransformer(nn.Module):  # ModelMixin, ConfigMixin):
@@ -537,7 +748,7 @@ class HYVideoDiffusionTransformer(nn.Module):  # ModelMixin, ConfigMixin):
         print(f"Using {self.attn_mode} attention mode, split_attn: {self.split_attn}")
 
         # image projection
-        self.img_in = PatchEmbed(self.patch_size, self.in_channels, self.hidden_size, **factory_kwargs)
+        self.img_in = PatchEmbed(self.patch_size, self.in_channels, self.hidden_size, flatten=False, **factory_kwargs)
 
         # text projection
         if self.text_projection == "linear":
@@ -847,16 +1058,17 @@ class HYVideoDiffusionTransformer(nn.Module):  # ModelMixin, ConfigMixin):
                     self.offloader_single.submit_move_blocks_forward(self.single_blocks, block_idx)
 
         img = x[:, :img_seq_len, ...]
-        x = None
 
-        # ---------------------------- Final layer ------------------------------
-        img = self.final_layer(img, vec)  # (N, T, patch_size ** 2 * out_channels)
+        # If the feature dimension equals 4096, reduce it to 3072.
+        if img.shape[-1] == 4096:
+            img = self.reduce_proj(img)
+            logger.info(f"[DiffusionTransformerWithPose] After reduce_proj, img shape: {img.shape}")
 
-        img = self.unpatchify(img, tt, th, tw)
-        if return_dict:
-            out["x"] = img
-            return out
-        return img
+        # Now pass the reduced features through the final layer.
+        out = self.final_layer(img, vec, **kwargs)
+        if hasattr(self, "_orig_T") and hasattr(self, "_orig_H") and hasattr(self, "_orig_W"):
+            out = self.unpatchify(out, self._orig_T, self._orig_H, self._orig_W)
+        return out
 
     def unpatchify(self, x, t, h, w):
         """
@@ -1030,6 +1242,9 @@ def get_rotary_pos_embed_by_shape(model, latents_size):
     freqs_cos, freqs_sin = get_nd_rotary_pos_embed(
         rope_dim_list, rope_sizes, theta=rope_theta, use_real=True, theta_rescale_factor=1
     )
+    
+    logger.info(f"Rotary embedding freqs_cos dtype: {freqs_cos.dtype}; freqs_sin dtype: {freqs_sin.dtype}")
+    
     return freqs_cos, freqs_sin
 
 

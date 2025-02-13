@@ -358,11 +358,12 @@ class BucketBatchManager:
         bucket = self.buckets[bucket_reso]
         start = batch_idx * self.batch_size
         end = min(start + self.batch_size, len(bucket))
-
+        
         latents = []
         llm_embeds = []
         llm_masks = []
         clip_l_embeds = []
+        pose_latents = []
         for item_info in bucket[start:end]:
             sd = load_file(item_info.latent_cache_path)
             latent = None
@@ -371,7 +372,7 @@ class BucketBatchManager:
                     latent = sd[key]
                     break
             latents.append(latent)
-
+        
             sd = load_file(item_info.text_encoder_output_cache_path)
             llm_embed = llm_mask = clip_l_embed = None
             for key in sd.keys():
@@ -386,13 +387,24 @@ class BucketBatchManager:
             llm_embeds.append(llm_embed)
             llm_masks.append(llm_mask)
             clip_l_embeds.append(clip_l_embed)
-
+        
+            # Use item_info.latent_cache_path instead of item.latent_cache_path
+            pose_path = item_info.latent_cache_path.replace(f"_{ARCHITECTURE_HUNYUAN_VIDEO}.safetensors",
+                                                             f"_{ARCHITECTURE_HUNYUAN_VIDEO}_pose.safetensors")
+            if not os.path.exists(pose_path):
+                logger.warning(f"Pose cache file not found: {pose_path}")
+                pose_latents.append(torch.zeros_like(torch.stack(latents)[0]))
+            else:
+                pose_dict = load_file(pose_path)
+                pose_latents.append(pose_dict["latent"])
+        
         latents = torch.stack(latents)
         llm_embeds = torch.stack(llm_embeds)
         llm_masks = torch.stack(llm_masks)
         clip_l_embeds = torch.stack(clip_l_embeds)
-
-        return latents, llm_embeds, llm_masks, clip_l_embeds
+        pose_embeds = torch.stack(pose_latents)
+        
+        return latents, llm_embeds, llm_masks, clip_l_embeds, pose_embeds
 
 
 class ContentDatasource:
