@@ -441,13 +441,17 @@ class DiffusionTransformerWithPose(nn.Module):
       3) Insert pose features at selected injection_layers.
     """
 
-    def __init__(self, base_transformer, pose_adapter: PoseAdapter, injection_layers=(2, 5, 8)):
+    def __init__(self, base_transformer, pose_adapter: PoseAdapter, injection_layers=None):
         super().__init__()
         # The base model is your pre-existing HYVideoDiffusionTransformer,
         # which has .img_in, .double_blocks, .single_blocks, .final_layer, etc.
         self.transformer = base_transformer
         self.pose_adapter = pose_adapter
-        self.injection_layers = set(injection_layers)  # layers to apply pose injection
+        
+        if injection_layers is None:
+            injection_layers = range(len(base_transformer.double_blocks))
+
+        self.injection_layers = set(injection_layers)
 
         # A simple 1×1×1 conv (or linear) to match your hidden dimension after pose_adapter
         # so that pose_features match self.transformer.hidden_size.
@@ -480,6 +484,8 @@ class DiffusionTransformerWithPose(nn.Module):
         6) final layer -> up or unpatchify
         """
 
+        logger.info(f"(DEBUG) main latents x shape={x.shape}, dtype={x.dtype}")
+
         # 1) Image patch embedding (the base model's standard approach).
         #    Suppose base_transformer.img_in(...) => shape (B, hidden_size, T, H, W).
         img = self.transformer.img_in(x)  
@@ -496,6 +502,7 @@ class DiffusionTransformerWithPose(nn.Module):
         # 2) If we have a pose_input, pass it to the pose_adapter, then
         #    interpolate to the exact (T, H, W).
         if pose_input is not None:
+            logger.info(f"(DEBUG) actual pose_input shape={pose_input.shape}, dtype={pose_input.dtype}")
             # Pose adapter: shape => (B, outC, T_orig, H_orig, W_orig) => (B, outC, T~, H~, W~)
             pose_features = self.pose_adapter(pose_input)  # still (B, outC, T_orig, H_orig, W_orig)
 
@@ -579,6 +586,7 @@ class DiffusionTransformerWithPose(nn.Module):
         # 6) If the base model does a final linear or final up-projection:
         out = self.transformer.final_layer(output_img, vec)
         # out = self.transformer.unpatchify(out, T, H, W)
+        logger.info(f"(DEBUG) PoseAdapter output of conv shape={out.shape}, dtype={out.dtype}")
         return out
 
 

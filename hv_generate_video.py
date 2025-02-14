@@ -24,9 +24,10 @@ from hunyuan_model import vae
 from hunyuan_model.text_encoder import TextEncoder
 from hunyuan_model.text_encoder import PROMPT_TEMPLATE
 from hunyuan_model.vae import load_vae
-from hunyuan_model.models import load_transformer, get_rotary_pos_embed
+from hunyuan_model.models import load_transformer, get_rotary_pos_embed, HYVideoDiffusionTransformer, DiffusionTransformerWithPose
 from modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
 from networks import lora
+from networks.pose_adapter import PoseAdapter
 try:
     from lycoris.kohya import create_network_from_weights
 except:
@@ -579,7 +580,13 @@ def main():
         # if we use LoRA, weigths should be bf16 instead of fp8, because merging should be done in bf16
         # the model is too large, so we load the model to cpu. in addition, the .pt file is loaded to cpu anyway
         # on the fly merging will be a solution for this issue for .safetenors files
-        transformer = load_transformer(args.dit, args.attn_mode, args.split_attn, loading_device, dit_dtype)
+        base_transformer = load_transformer(args.dit, args.attn_mode, args.split_attn, loading_device, dit_dtype)
+        pose_adapter = PoseAdapter(in_channels=16, out_channels=16, mid_channels=32, num_layers=3)
+        transformer = DiffusionTransformerWithPose(
+           base_transformer, 
+           pose_adapter, 
+           injection_layers=(2, 5, 8),  # or whatever layers you used in training
+        )
         transformer.eval()
 
         # load LoRA weights
@@ -690,51 +697,40 @@ def main():
             )
         latents_noise = torch.cat(latents_noise_list, dim=2)
         
-        # NEW: if pose guidance is enabled, load and encode pose maps, then add (weighted) to noise
+        z_pose = None
         if args.use_pose:
             if args.pose_path is None:
                 raise ValueError("Pose guidance enabled but no --pose_path provided.")
-            
-            # Reuse helper functions from dataset/image_video_dataset.py:
-            from dataset.image_video_dataset import load_video
-            
-            # load pose frames (assuming they are provided as images or as a video)
+
+            # Load skeleton frames or video frames
             if os.path.isdir(args.pose_path):
                 pose_frames = load_images(args.pose_path, args.video_length, bucket_reso=(width, height))
             else:
                 pose_frames = load_video(args.pose_path, 0, args.video_length, bucket_reso=(width, height))
-                
-            # Now pad (if needed) so that you have args.video_length raw frames
+
+            # Pad/truncate frames as needed
             if len(pose_frames) < args.video_length:
                 missing = args.video_length - len(pose_frames)
-                pose_frames = pose_frames + [pose_frames[-1]] * missing
+                pose_frames.extend([pose_frames[-1]] * missing)
             else:
                 pose_frames = pose_frames[:args.video_length]
-            
-            # Convert each pose frame (a numpy array of shape [H, W, C]) to a torch tensor in shape [C, H, W]
+
+            # Convert frames to torch, shape (1, 16, T, H//8, W//8) after encode
             pose_tensor_list = []
             for frame in pose_frames:
                 tensor = torch.from_numpy(frame).permute(2, 0, 1)
                 pose_tensor_list.append(tensor)
-            # Stack into (T, C, H, W)
             pose_tensor = torch.stack(pose_tensor_list, dim=0)
-            # Add a batch dimension for one video --> (1, T, C, H, W)
-            pose_tensor = pose_tensor.unsqueeze(0)
-            # Rearrange to have channels first: (1, C, T, H, W)
-            pose_tensor = pose_tensor.permute(0, 2, 1, 3, 4).to(device, dtype=vae_dtype)
-            # Normalize as in cache_latents.py (images are in [0,255])
+            pose_tensor = pose_tensor.unsqueeze(0).permute(0, 2, 1, 3, 4).to(device, dtype=vae_dtype)
             pose_tensor = pose_tensor.float() / 127.5 - 1.0
-            # Convert to half (torch.float16)
             pose_tensor = pose_tensor.half().to(device)
 
             with torch.no_grad():
                 z_pose = vae.encode(pose_tensor).latent_dist.sample()
-            # z_pose will have shape (1, 16, latent_video_length, H/vae_scale_factor, W/vae_scale_factor)
-            # Combine with noise
-            pose_alpha = args.pose_alpha
-            latents = latents_noise + (pose_alpha * z_pose)
-        else:
-            latents = latents_noise
+            # Do NOT add z_pose to latents. Let the adapter see it instead.
+
+        # (*) Changed: Just set latents = latents_noise. The adapter will handle z_pose in the loop.
+        latents = latents_noise
 
         if args.video_path is not None:
             # v2v inference
@@ -771,50 +767,41 @@ def main():
         freqs_sin = freqs_sin.to(device=device, dtype=dit_dtype)
 
         def get_pose_alpha(step_idx: int, total_steps: int, start: float, end: float = 0.0) -> float:
-            """
-            Linearly decay the pose alpha from start to end over total_steps.
-            For step_idx==0 returns start, and for step_idx==total_steps-1 returns end.
-            """
             if total_steps <= 1:
                 return start
-            alpha = start + (end - start) * (step_idx / (total_steps - 1))
-            return alpha
+            return start + (end - start) * (step_idx / (total_steps - 1))
 
+        if args.dit_dtype is not None:
+            dit_dtype = str_to_dtype(args.dit_dtype) 
+        else:
+            dit_dtype = torch.bfloat16
 
         num_warmup_steps = len(timesteps) - num_inference_steps * scheduler.order  # this should be 0 in v2v inference
         # with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]) as p:
         with tqdm(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
-                # Compute the current alpha using the declining schedule.
                 current_pose_alpha = get_pose_alpha(i, num_inference_steps, start=args.pose_alpha, end=0.0)
-                
-                # If pose guidance is enabled, add the (current_pose_alpha * z_pose) to the current latent.
-                if args.use_pose:
-                    # Note: You want to add the control signal at every denoising step.
-                    # Here we inject it into the latent before scaling.
-                    latents_with_pose = latents + (current_pose_alpha * z_pose)
-                else:
-                    latents_with_pose = latents
-                
-                # Scale the input of the model per the scheduler.
-                scaled_input = scheduler.scale_model_input(latents_with_pose, t)
-                
+
+                # (*) Changed: Do not add z_pose externally
+                latents_input = scheduler.scale_model_input(latents, t)
+
                 with torch.no_grad(), accelerator.autocast():
+                    # (*) Changed: pass pose_input=z_pose and pose_alpha=current_pose_alpha
                     noise_pred = transformer(
-                        scaled_input,
-                        t.repeat(latents.shape[0]).to(device=device, dtype=dit_dtype),
+                        latents_input,
+                        t.repeat(latents_input.shape[0]).to(device=device, dtype=dit_dtype),
                         text_states=prompt_embeds,
                         text_mask=prompt_mask,
                         text_states_2=prompt_embeds_2,
                         freqs_cos=freqs_cos,
                         freqs_sin=freqs_sin,
                         guidance=guidance_expand,
-                        return_dict=True,
-                    )["x"]
-                
-                # Update the latents based on the noise prediction:
+                        pose_input=z_pose,             # Here’s your skeleton latent
+                        pose_alpha=current_pose_alpha, # Let the adapter scale it
+                        return_dict=False,
+                    )
+
                 latents = scheduler.step(noise_pred, t, latents, return_dict=False)[0]
-                
                 progress_bar.update()
 
         # print(p.key_averages().table(sort_by="self_cpu_time_total", row_limit=-1))

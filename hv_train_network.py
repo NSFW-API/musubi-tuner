@@ -472,32 +472,28 @@ def sample_image_inference(
     latents_noise = torch.cat(latents_noise_list, dim=2)
     logger.info(f"Built noise latents shape={latents_noise.shape}, dtype={latents_noise.dtype}")
     
-    # Maybe store pose_latent for logging if needed
+    # Build noise latents as before:
+    latents = latents_noise
+
+    # Now define pose_latent (None by default)
+    # ----------------------------------------------------------------
+    # 1) Load the pose latent from disk
+    # ----------------------------------------------------------------
     pose_latent = None
     if args.pose is not None:
         from safetensors.torch import load_file
         logger.info(f"Loading pose from {args.pose}")
         pose_data = load_file(args.pose)
-        logger.info(f"Pose file keys: {pose_data.keys()}")
+        pose_latent = pose_data["latent"].to(accelerator.device, dtype=dit_dtype)
         
-        pose_latent = pose_data["latent"].to(device, dtype=dit_dtype)
-        logger.info(f"Pose latent after .to(device, dtype=dit_dtype) => shape={pose_latent.shape}, dtype={pose_latent.dtype}")
-        
+        # -- Add logging for its shape/dtype:
+        logger.info(f"(DEBUG) Pose latent loaded from disk has shape={pose_latent.shape}, dtype={pose_latent.dtype}")
+
+        # If your code expects (B,C,T,H,W) but the file is (T,C,H,W), fix it here:
         if pose_latent.ndim == 4:
+            # interpret dim0 as frames => shape (F, C, H, W)
+            # Insert a batch dimension and reorder to (B=1, C, T=F, H, W):
             pose_latent = pose_latent.unsqueeze(0)
-            logger.info(f"Pose latent unsqueezed => shape={pose_latent.shape}")
-        
-        target_shape = latents_noise.shape[-3:]
-        if pose_latent.shape[-3:] != target_shape:
-            logger.info(f"Interpolating pose latent from {pose_latent.shape[-3:]} => {target_shape}")
-            pose_latent = torch.nn.functional.interpolate(
-                pose_latent, size=target_shape, mode="trilinear", align_corners=False
-            )
-        
-        logger.info(f"Final pose_latent shape={pose_latent.shape}, dtype={pose_latent.dtype}")
-        latents = latents_noise + args.pose_alpha * pose_latent
-    else:
-        latents = latents_noise
     
     guidance_expand = torch.tensor([guidance_scale * 1000.0], dtype=torch.float32, device=device).to(dit_dtype)
     logger.info(f"Guidance expand shape={guidance_expand.shape}, dtype={guidance_expand.dtype}, data={guidance_expand}")
@@ -531,18 +527,14 @@ def sample_image_inference(
         for i, t in enumerate(tqdm(timesteps, desc=f"Sampling prompt_idx={prompt_idx}")):
             alpha_t = get_pose_alpha(i, len(timesteps), start=args.pose_alpha, end=0.0)
             
-            # Re-add skeleton if we do pose injection
-            if pose_latent is not None:
-                latents_step = latents + alpha_t * pose_latent
-            else:
-                latents_step = latents
+            latents_step = latents.clone()
             
             # Log shapes/dtypes at each step if needed
             logger.info(
                 f"Step {i}: alpha_t={alpha_t:.4f}, latents_step shape={latents_step.shape}, dtype={latents_step.dtype}, t={t}"
             )
             
-            latents_step = scheduler.scale_model_input(latents_step, t)
+            scaled_input = scheduler.scale_model_input(latents_step, t)
             
             # If for some reason t is still a python scalar or if dtype is str:
             logger.info(f" t.repeat => {t.repeat(latents_step.shape[0])}, device={device}, dtype={dit_dtype}")
@@ -551,13 +543,14 @@ def sample_image_inference(
             
             # Now call the transformer
             noise_pred = transformer(
-                latents_step,
-                time_tensor,
+                x=scaled_input,                # The usual diffusion latents
+                t=time_tensor,
                 text_states=prompt_embeds,
-                text_mask=prompt_mask,
                 text_states_2=prompt_embeds_2,
                 freqs_cos=freqs_cos,
                 freqs_sin=freqs_sin,
+                pose_input=pose_latent,        # Pass your skeleton or pose encoding here
+                pose_alpha=alpha_t,            # How strongly to apply that skeleton
                 guidance=guidance_expand,
                 return_dict=False,
             )
@@ -566,12 +559,17 @@ def sample_image_inference(
             T_token = T_final
             H_token = H_final // 2
             W_token = W_final // 2
+            
+            # same T_token, H_token, W_token you use in training
+            noise_pred = transformer.unpatchify(
+              noise_pred,
+              T_token,  # e.g. the same T as latents.shape[2]
+              H_token,  # e.g. half of latents.shape[3] if patch_size=2
+              W_token   # e.g. half of latents.shape[4] if patch_size=2
+            )
 
-            noise_pred_unpatched = transformer.unpatchify(noise_pred, T_token, H_token, W_token)
-            
-            logger.info(f"noise_pred shape={noise_pred.shape}, dtype={noise_pred.dtype}")
-            
-            latents = scheduler.step(noise_pred_unpatched, t, latents, return_dict=False)[0]
+            # Then step the scheduler:
+            latents = scheduler.step(noise_pred, t, latents, return_dict=False)[0]
     
     # Decode latents
     logger.info("Decoding latents...")
@@ -1283,7 +1281,8 @@ class NetworkTrainer:
         transformer.eval()
 
         # Create the pose adapter module.
-        injection_layers = [2, 5, 8]
+#       injection_layers = [2, 5, 8]
+        injection_layers = None
         pose_adapter = PoseAdapter(in_channels=16, out_channels=16, mid_channels=32, num_layers=3)
         pose_adapter = pose_adapter.to(accelerator.device, dtype=dit_dtype)
 
@@ -1302,13 +1301,23 @@ class NetworkTrainer:
         logger.info(f"[AFTER LOADING] Pose projection weight dtype: {transformer.pose_proj.weight.dtype}")
         logger.info(f"[AFTER LOADING] Reduce projection weight dtype: {transformer.reduce_proj.weight.dtype}")
 
-        # Freeze the whole transformer first.
-        for param in transformer.parameters():
+        for name, param in transformer.named_parameters():
             param.requires_grad = False
-        # Unfreeze only the parameters in the new adapter branch.
+
+        # Unfreeze the pose_adapter
         for name, param in transformer.pose_adapter.named_parameters():
             param.requires_grad = True
-            logger.info(f"Unfreezing pose adapter parameter: {name}")
+            logger.info(f"Unfreezing pose_adapter param: {name}")
+
+        # Also unfreeze the pose_proj
+        for name, param in transformer.pose_proj.named_parameters():
+            param.requires_grad = True
+            logger.info(f"Unfreezing pose_proj param: {name}")
+
+        # And unfreeze reduce_proj if you are actually using it
+        for name, param in transformer.reduce_proj.named_parameters():
+            param.requires_grad = True
+            logger.info(f"Unfreezing reduce_proj param: {name}")
 
         if blocks_to_swap > 0:
             logger.info(f"enable swap {blocks_to_swap} blocks to CPU from device: {accelerator.device}")
