@@ -580,13 +580,14 @@ def main():
         # if we use LoRA, weigths should be bf16 instead of fp8, because merging should be done in bf16
         # the model is too large, so we load the model to cpu. in addition, the .pt file is loaded to cpu anyway
         # on the fly merging will be a solution for this issue for .safetenors files
-        base_transformer = load_transformer(args.dit, args.attn_mode, args.split_attn, loading_device, dit_dtype)
-        pose_adapter = PoseAdapter(in_channels=16, out_channels=16, mid_channels=32, num_layers=3)
-        transformer = DiffusionTransformerWithPose(
-           base_transformer, 
-           pose_adapter, 
-           injection_layers=(2, 5, 8),  # or whatever layers you used in training
-        )
+#        base_transformer = load_transformer(args.dit, args.attn_mode, args.split_attn, loading_device, dit_dtype)
+#        pose_adapter = PoseAdapter(in_channels=16, out_channels=16, mid_channels=32, num_layers=3)
+#        transformer = DiffusionTransformerWithPose(
+#           base_transformer, 
+#           pose_adapter, 
+#           injection_layers=(2, 5, 8),  # or whatever layers you used in training
+#        )
+        transformer = load_transformer(args.dit, args.attn_mode, args.split_attn, loading_device, dit_dtype)
         transformer.eval()
 
         # load LoRA weights
@@ -771,10 +772,10 @@ def main():
                 return start
             return start + (end - start) * (step_idx / (total_steps - 1))
 
-        if args.dit_dtype is not None:
-            dit_dtype = str_to_dtype(args.dit_dtype) 
-        else:
-            dit_dtype = torch.bfloat16
+#        if args.dit_dtype is not None:
+#            dit_dtype = str_to_dtype(args.dit_dtype) 
+#        else:
+#            dit_dtype = torch.bfloat16
 
         num_warmup_steps = len(timesteps) - num_inference_steps * scheduler.order  # this should be 0 in v2v inference
         # with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]) as p:
@@ -796,8 +797,8 @@ def main():
                         freqs_cos=freqs_cos,
                         freqs_sin=freqs_sin,
                         guidance=guidance_expand,
-                        pose_input=z_pose,             # Here’s your skeleton latent
-                        pose_alpha=current_pose_alpha, # Let the adapter scale it
+#                        pose_input=z_pose,             # Here’s your skeleton latent
+#                        pose_alpha=current_pose_alpha, # Let the adapter scale it
                         return_dict=False,
                     )
 

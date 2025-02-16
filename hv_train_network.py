@@ -554,21 +554,7 @@ def sample_image_inference(
                 guidance=guidance_expand,
                 return_dict=False,
             )
-            
-            B, _, T_final, H_final, W_final = latents.shape
-            T_token = T_final
-            H_token = H_final // 2
-            W_token = W_final // 2
-            
-            # same T_token, H_token, W_token you use in training
-            noise_pred = transformer.unpatchify(
-              noise_pred,
-              T_token,  # e.g. the same T as latents.shape[2]
-              H_token,  # e.g. half of latents.shape[3] if patch_size=2
-              W_token   # e.g. half of latents.shape[4] if patch_size=2
-            )
 
-            # Then step the scheduler:
             latents = scheduler.step(noise_pred, t, latents, return_dict=False)[0]
     
     # Decode latents
@@ -1278,19 +1264,20 @@ class NetworkTrainer:
 
         # Load DiT model using dit_weight_dtype for its weights.
         transformer = load_transformer(args.dit, attn_mode, args.split_attn, loading_device, dit_weight_dtype)
+        if hasattr(transformer.img_in, "flatten"):
+            transformer.img_in.flatten = False
         transformer.eval()
 
         # Create the pose adapter module.
 #       injection_layers = [2, 5, 8]
-        injection_layers = None
         pose_adapter = PoseAdapter(in_channels=16, out_channels=16, mid_channels=32, num_layers=3)
         pose_adapter = pose_adapter.to(accelerator.device, dtype=dit_dtype)
 
         # Wrap the base transformer with the pose adapter
-        transformer = DiffusionTransformerWithPose(transformer, pose_adapter, injection_layers)
+        transformer = DiffusionTransformerWithPose(transformer, pose_adapter)
         transformer = transformer.to(accelerator.device, dtype=dit_weight_dtype)
         transformer.pose_proj = transformer.pose_proj.to(accelerator.device, dtype=dit_weight_dtype)
-        transformer.reduce_proj = transformer.reduce_proj.to(accelerator.device, dtype=dit_weight_dtype)
+#        transformer.reduce_proj = transformer.reduce_proj.to(accelerator.device, dtype=dit_weight_dtype)
 
         for name, param in transformer.named_parameters():
             logger.info(f"Transformer param: {name} is on device {param.device} with dtype {param.dtype}")
@@ -1299,7 +1286,7 @@ class NetworkTrainer:
         logger.info(f"[AFTER LOADING] Transformer weight dtype: {next(transformer.parameters()).dtype}")
         logger.info(f"[AFTER LOADING] PoseAdapter first parameter dtype: {next(transformer.pose_adapter.parameters()).dtype}")
         logger.info(f"[AFTER LOADING] Pose projection weight dtype: {transformer.pose_proj.weight.dtype}")
-        logger.info(f"[AFTER LOADING] Reduce projection weight dtype: {transformer.reduce_proj.weight.dtype}")
+#        logger.info(f"[AFTER LOADING] Reduce projection weight dtype: {transformer.reduce_proj.weight.dtype}")
 
         for name, param in transformer.named_parameters():
             param.requires_grad = False
@@ -1315,9 +1302,9 @@ class NetworkTrainer:
             logger.info(f"Unfreezing pose_proj param: {name}")
 
         # And unfreeze reduce_proj if you are actually using it
-        for name, param in transformer.reduce_proj.named_parameters():
-            param.requires_grad = True
-            logger.info(f"Unfreezing reduce_proj param: {name}")
+#        for name, param in transformer.reduce_proj.named_parameters():
+#            param.requires_grad = True
+#            logger.info(f"Unfreezing reduce_proj param: {name}")
 
         if blocks_to_swap > 0:
             logger.info(f"enable swap {blocks_to_swap} blocks to CPU from device: {accelerator.device}")
@@ -1780,6 +1767,8 @@ class NetworkTrainer:
                     logger.info(f"Guidance vector dtype: {guidance_vec.dtype}")
                     
                     with accelerator.autocast():
+                        logger.info(f"scaled_input shape={noisy_model_input.shape}")
+                        
                         model_pred = transformer(
                             noisy_model_input,    # shape (B,16,T,H,W)
                             timesteps,            # shape (B,)
@@ -1796,18 +1785,18 @@ class NetworkTrainer:
                         
                         logger.info(f"Transformer raw output dtype: {model_pred.dtype}")
 
-                    B, C_target, T_target, H_target, W_target = latents.shape  # target: [1, 16, 13, 42, 28]
-                    # For patch_size [1,2,2] we compute the token dimensions:
-                    T_token = T_target                     # = 13
-                    H_token = H_target // 2                # = 42//2 = 21
-                    W_token = W_target // 2                # = 28//2 = 14
-
-                    # Use the transformer’s built‐in unpatchify function.
-                    model_pred_unpatched = transformer.unpatchify(model_pred, T_token, H_token, W_token)
+                    B, C_target, T_target, H_target, W_target = latents.shape  # target: [1, 16, 2, 46, 26]
+                    patch_t, patch_h, patch_w = transformer.patch_size  # typically [1,2,2]  
+                    T_token = T_target // patch_t  
+                    H_token = H_target // patch_h  
+                    W_token = W_target // patch_w  
+                    
+                    logger.info(f"transformer.patch_size={transformer.patch_size}")  
+                    logger.info(f"model_pred shape={model_pred.shape}, T_token={T_token}, H_token={H_token}, W_token={W_token}, product={T_token*H_token*W_token}")
 
                     # Now compute loss between the unpatchified output and the target latents.
-                    target = (noise - latents).to(network_dtype) # Both shape: [B, 16, 13, 42, 28]
-                    loss = torch.nn.functional.mse_loss(model_pred_unpatched.to(network_dtype), target, reduction="none")
+                    target = (noise - latents).to(network_dtype) # Both shape: [B, 16, 2, 46, 26]
+                    loss = torch.nn.functional.mse_loss(model_pred.to(network_dtype), target, reduction="none")
                     loss = loss.mean()
                     if weighting is not None:
                         loss = loss * weighting
