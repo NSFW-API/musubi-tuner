@@ -88,23 +88,13 @@ def advanced_pose_postprocess(
 
 def get_pose_image(frame: np.ndarray) -> np.ndarray:
     """
-    Given an input frame (assumed to be an RGB image in [0,255] with shape (H, W, C)),
-    ensure it has 3 channels, run DWpose, then postprocess the output.
-    Returns an RGB image (H, W, 3) in [0,255] (dtype uint8).
+    Use DWpose directly, returning its neon-on-black skeleton without extra postprocessing.
+    Assumes the result is in [0,255] range with a black background and neon lines.
     """
     frame = ensure_rgb(frame)
-    raw_pose = pose_detector(frame)  # DWpose output; might not have exactly 3 channels
-    raw_pose = reduce_channels_to_rgb(raw_pose)
-    processed_pose = advanced_pose_postprocess(
-        raw_pose,
-        background_color=(128, 128, 128),
-        line_color=(220, 220, 220),
-        unify_lines=True,
-        do_blur=True,
-        blur_ksize=9,
-        blur_sigma=3.0
-    )
-    return processed_pose
+    raw_pose = pose_detector(frame)    # Pose map from DWpose
+    raw_pose = reduce_channels_to_rgb(raw_pose)  # If DWpose returned >3 channels, collapse them
+    return raw_pose  # No advanced postprocessing—keep the original neon skeleton
 
 def encode_pose_sequence(
     vae: AutoencoderKLCausal3D,

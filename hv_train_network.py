@@ -516,16 +516,14 @@ def sample_image_inference(
     logger.info(f"Beginning diffusion sampling; timesteps={timesteps}, len={len(timesteps)}")
     
     def get_pose_alpha(step, total_steps, start=1.0, end=0.0):
-        if total_steps <= 1:
-            return start
-        return start + (end - start) * (step / float(total_steps - 1))
+        return 1.0
     
     latents = latents.clone()
     
     from tqdm import tqdm
     with torch.no_grad():
         for i, t in enumerate(tqdm(timesteps, desc=f"Sampling prompt_idx={prompt_idx}")):
-            alpha_t = get_pose_alpha(i, len(timesteps), start=args.pose_alpha, end=0.0)
+            alpha_t = 1.0
             
             latents_step = latents.clone()
             
@@ -1171,9 +1169,7 @@ class NetworkTrainer:
     def train(self, args):
         
         def get_pose_alpha(step, total_steps, start=1.0, end=0.0):
-            if total_steps <= 1:
-                return start
-            return start + (end - start) * (step / float(total_steps - 1))
+            return 1.0
         
         # check required arguments
         if args.dataset_config is None:
