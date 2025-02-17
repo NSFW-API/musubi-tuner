@@ -34,8 +34,7 @@ def ensure_rgb(frame: np.ndarray) -> np.ndarray:
     """
     if frame.ndim != 3:
         raise ValueError(f"Expected a 3D array for frame, got shape {frame.shape}")
-    if frame.shape[-1] != 3:
-        # If there are extra channels (e.g. 16) then just take the first three.
+    if frame.shape[-1] > 3:
         frame = frame[..., :3]
     return frame
 
@@ -50,51 +49,15 @@ def reduce_channels_to_rgb(pose_image: np.ndarray) -> np.ndarray:
         pose_image = np.stack([gray, gray, gray], axis=-1)
     return pose_image
 
-def advanced_pose_postprocess(
-    pose_image: np.ndarray,
-    background_color: tuple = (128, 128, 128),
-    line_color: tuple = (220, 220, 220),
-    unify_lines: bool = True,
-    do_blur: bool = True,
-    blur_ksize: int = 9,
-    blur_sigma: float = 3.0
-) -> np.ndarray:
-    """
-    Process a raw skeleton image:
-      1) Replace the black background (pixels whose sum is 0) with background_color.
-      2) Optionally unify all non-background (skeleton) pixels to a single line_color.
-      3) Optionally apply Gaussian blur to soften edges.
-    Expects input pose_image with shape (H, W, 3) in [0,255] (dtype uint8).
-    """
-    out = pose_image.copy()  # (H, W, 3)
-    
-    # Replace background: assume any pixel with sum==0 is background.
-    bg_mask = (out.sum(axis=-1) == 0)
-    out[bg_mask] = background_color
-    
-    # Optionally, unify non-background lines to the given line_color.
-    if unify_lines:
-        line_mask = ~bg_mask
-        out[line_mask] = line_color
-        
-    # Optionally, blur the image.
-    if do_blur:
-        # OpenCV operates in BGR by default.
-        out_bgr = cv2.cvtColor(out.astype(np.uint8), cv2.COLOR_RGB2BGR)
-        out_bgr = cv2.GaussianBlur(out_bgr, (blur_ksize, blur_ksize), blur_sigma)
-        out = cv2.cvtColor(out_bgr, cv2.COLOR_BGR2RGB)
-        
-    return out
-
 def get_pose_image(frame: np.ndarray) -> np.ndarray:
     """
     Use DWpose directly, returning its neon-on-black skeleton without extra postprocessing.
     Assumes the result is in [0,255] range with a black background and neon lines.
     """
     frame = ensure_rgb(frame)
-    raw_pose = pose_detector(frame)    # Pose map from DWpose
-    raw_pose = reduce_channels_to_rgb(raw_pose)  # If DWpose returned >3 channels, collapse them
-    return raw_pose  # No advanced postprocessing—keep the original neon skeleton
+    raw_pose = pose_detector(frame)      # Pose map from DWpose
+    raw_pose = reduce_channels_to_rgb(raw_pose)
+    return raw_pose
 
 def encode_pose_sequence(
     vae: AutoencoderKLCausal3D,
@@ -105,16 +68,13 @@ def encode_pose_sequence(
     """
     Process the video frames in item.content as follows:
       1) Run get_pose_image() on each frame.
-      2) Optionally save each processed pose image for debugging.
+      2) Optionally save each pose image for debugging.
       3) Convert the processed image to a torch tensor (scaled to [-1, 1]).
       4) Stack tensors over the time dimension.
       5) Rearrange dimensions to (B, 3, F, H, W) which is then passed into the VAE.
       6) VAE-encode the pose sequence and return the sampled latent.
-      
-    Logging is added to report shapes at every step.
     """
     frames = item.content
-    # Convert to list if multiple frames
     if frames.ndim == 3:
         print(f"Single frame detected with shape: {frames.shape}")
         frames = [frames]
@@ -126,74 +86,60 @@ def encode_pose_sequence(
 
     pose_tensors = []
     for i, frame in enumerate(frames):
-        # Process the frame into a pose image (should have shape (H, W, 3))
+        # Produce the skeleton
         pose_img = get_pose_image(frame)
         print(f"Frame {i}: Raw pose image shape: {pose_img.shape}")
 
-        # Optionally, save processed pose image for debugging.
+        # (A) Optionally save the skeleton image for debugging
         if debug_pose_dir is not None:
             os.makedirs(debug_pose_dir, exist_ok=True)
+            # Some item info to ensure unique filenames
             base_stem = os.path.splitext(os.path.basename(item.latent_cache_path))[0]
             debug_fname = f"{base_stem}_pose_{i:03d}.png"
             debug_path = os.path.join(debug_pose_dir, debug_fname)
             Image.fromarray(pose_img.astype(np.uint8)).save(debug_path)
             print(f"Saved debug pose image to {debug_path}")
 
-        # Convert to torch tensor (from shape (H,W,3) -> (3,H,W)) and scale to [-1,1]
+        # (B) Convert to torch tensor in [-1,1]
         tensor_pose = torch.from_numpy(pose_img).permute(2, 0, 1).contiguous()
         tensor_pose = tensor_pose.to(vae.device, dtype=vae.dtype) / 127.5 - 1.0
-        print(f"Frame {i}: Pose tensor shape after conversion: {tensor_pose.shape}")
         pose_tensors.append(tensor_pose)
 
-    # Stack tensors along a new time dimension: (F, 3, H, W)
+    # Stack along new time dimension (F, 3, H, W)
     pose_seq = torch.stack(pose_tensors, dim=0).contiguous()
     print(f"Stacked pose sequence shape (F, 3, H, W): {pose_seq.shape}")
 
     # Add batch dimension -> (1, F, 3, H, W)
     pose_seq = pose_seq.unsqueeze(0)
-    # Permute to match VAE expectation: (1, 3, F, H, W)
+    # Rearrange => (1, 3, F, H, W)
     pose_seq = pose_seq.permute(0, 2, 1, 3, 4).contiguous()
     print(f"Pose sequence shape after permuting to (B, 3, F, H, W): {pose_seq.shape}")
 
-    # Pass the pose sequence through the VAE encoder.
+    # VAE encode
     with torch.no_grad():
-        # Note: Ensure that vae.encode() is being used so that the output is in latent space.
         encoded = vae.encode(pose_seq)
         latent = encoded.latent_dist.sample()
     print(f"Encoded pose latent shape: {latent.shape}")
-
-    # Check if the latent's channel dimension matches our expected value (e.g., 16)
-    expected_channels = 16  # Adjust if your model should output a different number.
-    if latent.dim() == 5:
-        channels = latent.shape[1]
-    elif latent.dim() == 4:
-        # if already squeezed, assume first dimension is channel
-        channels = latent.shape[0]
-    else:
-        channels = None
-    if channels != expected_channels:
-        print(f"WARNING: Expected latent channel dimension {expected_channels} but got {channels}")
-    else:
-        print(f"Latent channel dimension as expected: {channels}")
 
     return latent
 
 def save_pose_cache(item: ItemInfo, latent: torch.Tensor):
     """
     Save the pose latent to a safetensors file.
-    We expect latent to be of shape (1, C, F, H, W) from the VAE.
-    We then squeeze the batch dimension and, if necessary, permute to get (F, C, H, W)
+    We expect latent to be of shape (1, C, F, H, W) from the VAE,
+    then we reformat to (F, C, H, W).
     """
     if latent.ndim == 5 and latent.shape[0] == 1:
-        latent = latent.squeeze(0)  # now (C, F, H, W)
-    # We expect the final saved tensor to have frame as first dimension, so if shape is (C, F, H, W), permute:
-    expected_channels = 16  # update as needed (from VAE latent channels)
-    if latent.ndim == 4 and latent.shape[0] != expected_channels and latent.shape[1] == expected_channels:
-        latent = latent.permute(1, 0, 2, 3).contiguous()  # now (F, C, H, W)
+        latent = latent.squeeze(0)  # (C, F, H, W)
+    # if shape is (C, F, H, W), permute to (F, C, H, W)
+    if latent.ndim == 4 and latent.shape[0] == 16 and latent.shape[1] != 16:
+        latent = latent.permute(1, 0, 2, 3).contiguous()
     assert latent.ndim == 4, "latent should be 4D tensor (frame, channel, height, width)"
+
     folder = os.path.dirname(item.latent_cache_path)
     base = os.path.splitext(os.path.basename(item.latent_cache_path))[0]
     pose_cache_path = os.path.join(folder, base + "_pose.safetensors")
+
     metadata = {
         "architecture": "hunyuan_video_pose",
         "width": f"{item.original_size[0]}",
@@ -203,26 +149,33 @@ def save_pose_cache(item: ItemInfo, latent: torch.Tensor):
     save_file({"latent": latent.detach().cpu()}, pose_cache_path, metadata=metadata)
     logger.info(f"Saved pose latent cache to: {pose_cache_path}")
 
-def encode_and_save_batch(vae: AutoencoderKLCausal3D, batch: list[ItemInfo], use_pose: bool = False):
-    # Process the video latent branch (appearance) as before:
+def encode_and_save_batch(
+    vae: AutoencoderKLCausal3D, 
+    batch: list[ItemInfo], 
+    use_pose: bool = False,
+    debug_pose_dir: str = None
+):
+    # Standard (appearance) latents
     contents = torch.stack([torch.from_numpy(item.content) for item in batch])
     if len(contents.shape) == 4:
-        # if content shape is (B, H, W, C), add a frame dimension:
-        contents = contents.unsqueeze(1)
-    # Rearrange to (B, C, F, H, W)
-    contents = contents.permute(0, 4, 1, 2, 3).contiguous()
+        contents = contents.unsqueeze(1)  # (B,1,H,W,C)
+    contents = contents.permute(0,4,1,2,3).contiguous()  # => (B,C,F,H,W)
     contents = contents.to(vae.device, dtype=vae.dtype)
     contents = contents / 127.5 - 1.0
     with torch.no_grad():
         latent = vae.encode(contents).latent_dist.sample()
     for item, l in zip(batch, latent):
         save_latent_cache(item, l)
-    
-    # NEW: if use_pose flag is set, process the pose branch:
+
+    # Pose latents (if requested)
     if use_pose:
         for item in batch:
-            # This call returns the pose latents
-            z_pose = encode_pose_sequence(vae, item, bucket_reso=item.original_size, debug_pose_dir=None)
+            z_pose = encode_pose_sequence(
+                vae, 
+                item, 
+                bucket_reso=item.original_size,
+                debug_pose_dir=debug_pose_dir   # Pass the debug folder path
+            )
             save_pose_cache(item, z_pose)
 
 def main(args):
@@ -245,7 +198,7 @@ def main(args):
 
     assert args.vae is not None, "vae checkpoint is required"
 
-    # Load VAE model (HunyuanVideo VAE – which is float16)
+    # Load VAE
     vae_dtype = torch.float16 if args.vae_dtype is None else str_to_dtype(args.vae_dtype)
     vae, _, s_ratio, t_ratio = load_vae(vae_dtype=vae_dtype, device=device, vae_path=args.vae)
     vae.eval()
@@ -261,7 +214,7 @@ def main(args):
     elif args.vae_tiling:
         vae.enable_spatial_tiling(True)
 
-    # Encode each dataset sample
+    # Encode
     num_workers = args.num_workers if args.num_workers is not None else max(1, os.cpu_count() - 1)
     for i, dataset in enumerate(datasets):
         logger.info(f"Encoding dataset [{i}]")
@@ -275,15 +228,21 @@ def main(args):
                 batch = filtered_batch
             bs = args.batch_size if args.batch_size is not None else len(batch)
             for j in range(0, len(batch), bs):
-                encode_and_save_batch(vae, batch[j : j + bs], use_pose=args.use_pose)
-        # Remove cache files no longer needed (existing code as is)...
+                encode_and_save_batch(
+                    vae,
+                    batch[j : j + bs],
+                    use_pose=args.use_pose,
+                    debug_pose_dir=args.debug_pose_dir  # pass debug folder
+                )
+
+        # Remove cache files no longer needed
         all_latent_cache_paths = [os.path.normpath(p) for p in all_latent_cache_paths]
         all_latent_cache_paths = set(all_latent_cache_paths)
         all_cache_files = dataset.get_all_latent_cache_files()
         for cache_file in all_cache_files:
             if os.path.normpath(cache_file) not in all_latent_cache_paths:
                 if args.keep_cache:
-                    logger.info(f"Keep cache file not in the dataset: {cache_file}")
+                    logger.info(f"Keeping old cache file: {cache_file}")
                 else:
                     os.remove(cache_file)
                     logger.info(f"Removed old cache file: {cache_file}")
@@ -305,8 +264,16 @@ def setup_parser():
     parser.add_argument("--console_width", type=int, default=80, help="debug mode: console width")
     parser.add_argument("--console_back", type=str, default=None, help="debug mode: console background; choice from ascii_magic.Back")
     parser.add_argument("--console_num_images", type=int, default=None, help="debug mode: number of images to show for each dataset")
-    # Add new flag for pose caching:
     parser.add_argument("--use_pose", action="store_true", help="also cache pose latent from video using DWpose")
+
+    # (A) Add an argument for the debug pose folder
+    parser.add_argument(
+        "--debug_pose_dir",
+        type=str,
+        default=None,
+        help="Folder path where to save skeleton pose images for debugging."
+    )
+
     return parser
 
 if __name__ == "__main__":

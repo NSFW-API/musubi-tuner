@@ -577,17 +577,22 @@ def main():
         if args.attn_mode == "sdpa":
             args.attn_mode = "torch"
 
-        # if we use LoRA, weigths should be bf16 instead of fp8, because merging should be done in bf16
-        # the model is too large, so we load the model to cpu. in addition, the .pt file is loaded to cpu anyway
-        # on the fly merging will be a solution for this issue for .safetenors files
-#        base_transformer = load_transformer(args.dit, args.attn_mode, args.split_attn, loading_device, dit_dtype)
-#        pose_adapter = PoseAdapter(in_channels=16, out_channels=16, mid_channels=32, num_layers=3)
-#        transformer = DiffusionTransformerWithPose(
-#           base_transformer, 
-#           pose_adapter, 
-#           injection_layers=(2, 5, 8),  # or whatever layers you used in training
-#        )
-        transformer = load_transformer(args.dit, args.attn_mode, args.split_attn, loading_device, dit_dtype)
+        # Load the base transformer as usual  
+        base_transformer = load_transformer(args.dit, args.attn_mode, args.split_attn, loading_device, dit_dtype)  
+        
+        if hasattr(base_transformer.img_in, "flatten"):
+            base_transformer.img_in.flatten = False
+        
+        base_transformer.eval()  
+
+        # Create PoseAdapter
+        pose_adapter = PoseAdapter(in_channels=16, out_channels=16, mid_channels=32, num_layers=3)
+
+        # Wrap the base model in DiffusionTransformerWithPose
+        transformer = DiffusionTransformerWithPose(
+            base_transformer=base_transformer,
+            pose_adapter=pose_adapter,
+        )
         transformer.eval()
 
         # load LoRA weights
@@ -768,9 +773,7 @@ def main():
         freqs_sin = freqs_sin.to(device=device, dtype=dit_dtype)
 
         def get_pose_alpha(step_idx: int, total_steps: int, start: float, end: float = 0.0) -> float:
-            if total_steps <= 1:
-                return start
-            return start + (end - start) * (step_idx / (total_steps - 1))
+            return 1.0
 
 #        if args.dit_dtype is not None:
 #            dit_dtype = str_to_dtype(args.dit_dtype) 
@@ -787,18 +790,18 @@ def main():
                 latents_input = scheduler.scale_model_input(latents, t)
 
                 with torch.no_grad(), accelerator.autocast():
-                    # (*) Changed: pass pose_input=z_pose and pose_alpha=current_pose_alpha
                     noise_pred = transformer(
                         latents_input,
                         t.repeat(latents_input.shape[0]).to(device=device, dtype=dit_dtype),
                         text_states=prompt_embeds,
                         text_mask=prompt_mask,
                         text_states_2=prompt_embeds_2,
+                        guidance=guidance_expand,
+                        # IMPORTANT: pass the skeleton latent
+                        pose_input=z_pose,
+                        pose_alpha=current_pose_alpha,  # or 1.0 if you want a fixed strength
                         freqs_cos=freqs_cos,
                         freqs_sin=freqs_sin,
-                        guidance=guidance_expand,
-#                        pose_input=z_pose,             # Here’s your skeleton latent
-#                        pose_alpha=current_pose_alpha, # Let the adapter scale it
                         return_dict=False,
                     )
 

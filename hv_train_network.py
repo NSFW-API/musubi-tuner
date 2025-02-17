@@ -1265,7 +1265,6 @@ class NetworkTrainer:
         transformer.eval()
 
         # Create the pose adapter module.
-#       injection_layers = [2, 5, 8]
         pose_adapter = PoseAdapter(in_channels=16, out_channels=16, mid_channels=32, num_layers=3)
         pose_adapter = pose_adapter.to(accelerator.device, dtype=dit_dtype)
 
