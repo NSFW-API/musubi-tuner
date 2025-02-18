@@ -543,8 +543,8 @@ def sample_image_inference(
             noise_pred = transformer(
                 x=scaled_input,                # The usual diffusion latents
                 t=time_tensor,
-                text_states=prompt_embeds,
-                text_states_2=prompt_embeds_2,
+                text_states=None,
+                text_states_2=None,
                 freqs_cos=freqs_cos,
                 freqs_sin=freqs_sin,
                 pose_input=pose_latent,        # Pass your skeleton or pose encoding here
@@ -583,7 +583,12 @@ def sample_image_inference(
     
     # Save the final result
     if video.shape[2] == 1:
-        save_images_grid(video, os.path.join(save_dir, save_path), create_subdir=False)
+        save_images_grid(
+            videos=video,
+            parent_dir=save_dir,     # Could be just the directory
+            image_name=save_path,    # The file/stem name
+            create_subdir=False
+        )
     else:
         save_videos_grid(video, os.path.join(save_dir, save_path) + ".mp4")
     logger.info(f"Saved result to {save_path}")
@@ -1767,11 +1772,11 @@ class NetworkTrainer:
                         model_pred = transformer(
                             noisy_model_input,    # shape (B,16,T,H,W)
                             timesteps,            # shape (B,)
-                            text_states=llm_embeds,
+                            text_states=None,
                             pose_input=pose_tensor_for_adapter, 
                             pose_alpha=current_pose_alpha,
                             text_mask=llm_mask,
-                            text_states_2=clip_embeds,  
+                            text_states_2=None,  
                             freqs_cos=freqs_cos,
                             freqs_sin=freqs_sin,
                             guidance=guidance_vec, 

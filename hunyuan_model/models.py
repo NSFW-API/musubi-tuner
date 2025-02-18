@@ -435,17 +435,11 @@ class DiffusionTransformerWithPose(nn.Module):
     """
     A wrapper around the base_transformer (HYVideoDiffusionTransformer) that:
       • manually replicates the forward steps,
-      • injects pose features at *every* double_stream block.
-
-    This ensures the model sees the pose map repeatedly at each block,
-    providing stronger adherence to the skeleton.
+      • can optionally disable text conditioning if text_states is None,
+      • injects pose features at each double_stream block.
     """
 
-    def __init__(
-        self,
-        base_transformer,
-        pose_adapter,
-    ):
+    def __init__(self, base_transformer, pose_adapter):
         super().__init__()
         self.transformer = base_transformer
         self.pose_adapter = pose_adapter
@@ -460,7 +454,7 @@ class DiffusionTransformerWithPose(nn.Module):
         self,
         x: torch.Tensor,         # (B, in_channels=16, T, H, W)
         t: torch.Tensor,         # (B,) discrete timesteps
-        text_states: torch.Tensor,
+        text_states: torch.Tensor = None,
         text_states_2: torch.Tensor = None,
         text_mask: torch.Tensor = None,
         pose_input: torch.Tensor = None,
@@ -475,12 +469,13 @@ class DiffusionTransformerWithPose(nn.Module):
 
           (1) patch_embed => (B, hidden_size, T, H, W)
           (2) flatten => (B, T×H×W, hidden_size)
-          (3) text -> txt_in => (B, textLen, hidden_size)
+          (3) text -> txt_in => (B, textLen, hidden_size) [or zero-tokens if text_states=None]
           (4) time_in + vector_in => 'vec' (B, hidden_size), add guidance if needed
           (5) pass through *all* double_blocks => after each block, add pose to 'img'
           (6) single_blocks => merged image & text tokens
           (7) final_layer => unpatchify => (B, out_channels, T, H, W)
         """
+
         # ----------------- 1) Video branch embedding  -----------------
         img = self.transformer.img_in(x)  # shape: (B, hidden_size, T, H, W)
         B, hidden_size, T_, H_, W_ = img.shape
@@ -490,32 +485,49 @@ class DiffusionTransformerWithPose(nn.Module):
         img_seq_len = T_ * H_ * W_
         img = img.view(B, img_seq_len, hidden_size)
 
-        # 3) Text projection
-        if self.transformer.text_projection == "linear":
-            txt = self.transformer.txt_in(text_states)
-        elif self.transformer.text_projection == "single_refiner":
-            txt = self.transformer.txt_in(
-                text_states,
-                t,
-                text_mask if self.transformer.use_attention_mask else None,
-            )
+        # 3) Text projection (handle text_states=None to disable text)
+        if text_states is None:
+            txt = x.new_zeros((B, 1, hidden_size), dtype=img.dtype, device=img.device)
+            txt_seq_len = 1
         else:
-            raise NotImplementedError(
-                f"Unknown text_projection={self.transformer.text_projection}"
-            )
-        txt_seq_len = txt.shape[1]
+            # Normal text projection path
+            if self.transformer.text_projection == "linear":
+                txt = self.transformer.txt_in(text_states)
+            elif self.transformer.text_projection == "single_refiner":
+                txt = self.transformer.txt_in(
+                    text_states,
+                    t,
+                    text_mask if self.transformer.use_attention_mask else None,
+                )
+            else:
+                raise NotImplementedError(
+                    f"Unknown text_projection={self.transformer.text_projection}"
+                )
+            txt_seq_len = txt.shape[1]
 
-        # 4) Build conditioning vector 'vec' from t, text_states_2, guidance
-        vec = self.transformer.time_in(t)    # (B, hidden_size)
-        vec = vec + self.transformer.vector_in(text_states_2)
+        # 4) Build conditioning vector 'vec' from t, text_states_2, guidance.
+        #    If text_states_2 is None, skip that addition. Also handle guidance only if available.
+        vec = self.transformer.time_in(t)  # (B, hidden_size)
+
+        if text_states_2 is not None:
+            vec = vec + self.transformer.vector_in(text_states_2)
+
+        # guidance embed
         if self.transformer.guidance_embed:
-            if guidance is None:
-                raise ValueError("This model expects a 'guidance' tensor but none provided.")
-            vec = vec + self.transformer.guidance_in(guidance)
+            # If we want to disable guidance entirely, either pass guidance=None
+            # or fill it with zeros. Below is a minimal approach:
+            if guidance is not None:
+                vec = vec + self.transformer.guidance_in(guidance)
+            else:
+                # If the base model insists on guidance but we have none,
+                # you can either raise an error or do a zero vector:
+                # raise ValueError("Expecting guidance, but got None.")
+                guidance_zeros = vec.new_zeros((B,), dtype=vec.dtype, device=vec.device)
+                vec = vec + self.transformer.guidance_in(guidance_zeros)
 
         # 4a) Prepare/encode pose if provided
         if pose_input is not None:
-            # Run the pose_adapter (B, c, T, H, W)->(B, outC, T, H, W)
+            # Run the pose_adapter: (B, c, T, H, W)->(B, outC, T, H, W)
             pose_feats = self.pose_adapter(pose_input)
             # Interpolate to (T_, H_, W_)
             pose_feats = F.interpolate(
@@ -524,17 +536,18 @@ class DiffusionTransformerWithPose(nn.Module):
                 mode="trilinear",
                 align_corners=False,
             )
-            # Project to hidden_size
-            pose_feats = self.pose_proj(pose_feats)  # (B, hidden_size, T_, H_, W_)
-            # Flatten to (B, T×H×W, hidden_size)
+            # Project to hidden_size => (B, hidden_size, T_, H_, W_)
+            pose_feats = self.pose_proj(pose_feats)
+            # Flatten => (B, T×H×W, hidden_size)
             pose_feats = pose_feats.permute(0, 2, 3, 4, 1).contiguous()
             pose_feats = pose_feats.view(B, img_seq_len, hidden_size)
         else:
             pose_feats = None
 
-        # 5) Double-stream blocks—inject pose at *every* block
+        # 5) Double-stream blocks—inject pose at EVERY block
         for i, block in enumerate(self.transformer.double_blocks):
             block = block.to(x.device)
+            # run the block
             img, txt = block(
                 img,
                 txt,
@@ -547,18 +560,17 @@ class DiffusionTransformerWithPose(nn.Module):
                 max_seqlen_kv=None,
                 freqs_cis=(freqs_cos, freqs_sin) if freqs_cos is not None else None,
             )
-            # Always add pose—instead of checking i in injection_layers
+            # inject pose immediately after block
             if pose_feats is not None:
-                # Basic shape check
                 if pose_feats.shape[:2] != img.shape[:2]:
                     raise ValueError(
                         f"Pose shape mismatch at block {i}: "
                         f"pose_feats={pose_feats.shape}, img={img.shape}"
                     )
-                img = img + pose_alpha * pose_feats
+                img = img + (pose_alpha * pose_feats)
 
         # 6) Single-stream blocks: merge image & text tokens
-        x_merged = torch.cat([img, txt], dim=1)
+        x_merged = torch.cat([img, txt], dim=1)  # shape (B, img_seq_len+txt_seq_len, hidden_size)
         for blk in self.transformer.single_blocks:
             blk = blk.to(x.device)
             x_merged = blk(
@@ -585,7 +597,7 @@ class DiffusionTransformerWithPose(nn.Module):
             return {"x": out}
         return out
 
-    # Pass-through the other properties and helper methods if needed:
+    # Other pass-through properties/methods for convenience:
     @property
     def patch_size(self):
         return self.transformer.patch_size
